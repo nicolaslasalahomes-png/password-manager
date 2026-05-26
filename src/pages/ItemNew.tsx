@@ -1,11 +1,11 @@
-import { useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, Eye, EyeOff, RefreshCw, Save, Trash2 } from 'lucide-react'
 import Layout from '../components/Layout'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
-import { createItem, type ItemType, type VisibilityTier } from '../lib/items'
+import { createItem, listFolders, type ItemType, type VisibilityTier } from '../lib/items'
 import { generatePassword } from '../lib/generate'
 
 interface FieldDef {
@@ -47,6 +47,8 @@ export default function ItemNew() {
   const [type, setType] = useState<ItemType | string>('login')
   const [title, setTitle] = useState('')
   const [url, setUrl] = useState('')
+  const [folder, setFolder] = useState('')
+  const [folderOptions, setFolderOptions] = useState<string[]>([])
   const [tagsText, setTagsText] = useState('')
   const [tier, setTier] = useState<VisibilityTier>('medium')
   const [values, setValues] = useState<Record<string, string>>({})
@@ -55,6 +57,10 @@ export default function ItemNew() {
   const [submitting, setSubmitting] = useState(false)
 
   const fieldDefs = useMemo(() => fieldsForType(type), [type])
+
+  useEffect(() => {
+    listFolders().then(setFolderOptions).catch(() => {})
+  }, [])
 
   function toggleReveal(key: string) {
     setRevealedKeys((prev) => {
@@ -94,6 +100,7 @@ export default function ItemNew() {
         {
           type,
           title: title.trim(),
+          folder: folder.trim() || null,
           url: url.trim() || null,
           tags,
           visibility_tier: tier,
@@ -167,8 +174,23 @@ export default function ItemNew() {
               placeholder="e.g. GitHub — work account"
             />
           </div>
-          <div className="sm:col-span-2">
-            <label className="label">URL (optional, stored as plaintext)</label>
+          <div>
+            <label className="label">Folder</label>
+            <input
+              className="input"
+              list="folder-options"
+              value={folder}
+              onChange={(e) => setFolder(e.target.value)}
+              placeholder="e.g. Coral Autos"
+            />
+            <datalist id="folder-options">
+              {folderOptions.map((f) => (
+                <option key={f} value={f} />
+              ))}
+            </datalist>
+          </div>
+          <div>
+            <label className="label">URL (optional, plaintext)</label>
             <input
               className="input"
               value={url}

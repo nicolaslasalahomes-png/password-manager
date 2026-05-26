@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import { Lock, LogOut, Plus, ShieldCheck } from 'lucide-react'
+import { Lock, LogOut, Plus, ShieldCheck, Upload } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
@@ -28,9 +28,18 @@ export default function Layout({ children, rightSlot }: Props) {
           <div className="flex-1" />
           {rightSlot}
           {onVaultList && (
-            <Link to="/vault/new" className="btn-primary !px-3 !py-1.5">
-              <Plus size={14} /> New
-            </Link>
+            <>
+              <Link
+                to="/vault/import"
+                className="btn-ghost !px-2 !py-1.5"
+                title="Bulk import from JSON"
+              >
+                <Upload size={16} />
+              </Link>
+              <Link to="/vault/new" className="btn-primary !px-3 !py-1.5">
+                <Plus size={14} /> New
+              </Link>
+            </>
           )}
           <button
             onClick={() => {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, ExternalLink, Trash2 } from 'lucide-react'
+import { ArrowLeft, ExternalLink, Folder, Trash2 } from 'lucide-react'
 import Layout from '../components/Layout'
 import TypeIcon, { typeLabel } from '../components/TypeIcon'
 import TierBadge from '../components/TierBadge'
@@ -119,6 +119,11 @@ export default function ItemView() {
             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-ink-400">
               <span>{typeLabel(item.type)}</span>
               <TierBadge tier={item.visibility_tier} />
+              {item.folder && (
+                <span className="inline-flex items-center gap-1 text-ink-300">
+                  <Folder size={11} /> {item.folder}
+                </span>
+              )}
               {item.tags?.length > 0 && (
                 <>
                   <span>·</span>

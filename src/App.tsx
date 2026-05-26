@@ -10,6 +10,7 @@ import VaultUnlock from './pages/VaultUnlock'
 import VaultList from './pages/VaultList'
 import ItemNew from './pages/ItemNew'
 import ItemView from './pages/ItemView'
+import VaultImport from './pages/VaultImport'
 import FullPageLoader from './components/FullPageLoader'
 
 export default function App() {
@@ -62,6 +63,7 @@ export default function App() {
     <Routes>
       <Route path="/vault" element={<VaultList />} />
       <Route path="/vault/new" element={<ItemNew />} />
+      <Route path="/vault/import" element={<VaultImport />} />
       <Route path="/vault/:id" element={<ItemView />} />
       <Route path="*" element={<Navigate to="/vault" replace />} />
     </Routes>

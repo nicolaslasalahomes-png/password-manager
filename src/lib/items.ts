@@ -117,3 +117,70 @@ export async function touchLastAccessed(id: string): Promise<void> {
     .update({ last_accessed_at: new Date().toISOString() })
     .eq('id', id)
 }
+
+/** Distinct folder names used by the current user's items. */
+export async function listFolders(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('vault_items')
+    .select('folder')
+    .not('folder', 'is', null)
+  if (error) throw error
+  const set = new Set<string>()
+  for (const row of (data ?? []) as { folder: string | null }[]) {
+    if (row.folder) set.add(row.folder)
+  }
+  return Array.from(set).sort((a, b) => a.localeCompare(b))
+}
+
+export interface BulkImportItem {
+  type: ItemType | string
+  title: string
+  folder?: string | null
+  tags?: string[]
+  visibility_tier?: VisibilityTier
+  url?: string | null
+  username_hint?: string | null
+  fields: SecretFields
+}
+
+export interface BulkImportFile {
+  version: 1
+  items: BulkImportItem[]
+}
+
+export function validateImport(
+  raw: unknown,
+): { ok: true; file: BulkImportFile } | { ok: false; error: string } {
+  if (!raw || typeof raw !== 'object') return { ok: false, error: 'Root must be a JSON object' }
+  const r = raw as Record<string, unknown>
+  if (r.version !== 1) return { ok: false, error: `Unsupported version: ${String(r.version)}. Expected 1.` }
+  if (!Array.isArray(r.items)) return { ok: false, error: '`items` must be an array' }
+  const items: BulkImportItem[] = []
+  for (let i = 0; i < r.items.length; i++) {
+    const it = r.items[i] as Record<string, unknown>
+    if (!it || typeof it !== 'object') return { ok: false, error: `items[${i}] is not an object` }
+    if (typeof it.title !== 'string' || !it.title.trim()) return { ok: false, error: `items[${i}].title is required` }
+    if (typeof it.type !== 'string') return { ok: false, error: `items[${i}].type is required` }
+    if (!it.fields || typeof it.fields !== 'object') return { ok: false, error: `items[${i}].fields must be an object` }
+    const tier = (it.visibility_tier ?? 'medium') as VisibilityTier
+    if (!['low', 'medium', 'high'].includes(tier)) {
+      return { ok: false, error: `items[${i}].visibility_tier must be low|medium|high` }
+    }
+    const fields: SecretFields = {}
+    for (const [k, v] of Object.entries(it.fields as Record<string, unknown>)) {
+      if (typeof v !== 'string') return { ok: false, error: `items[${i}].fields["${k}"] must be a string` }
+      fields[k] = v
+    }
+    items.push({
+      type: it.type,
+      title: it.title.trim(),
+      folder: typeof it.folder === 'string' && it.folder.trim() ? it.folder.trim() : null,
+      tags: Array.isArray(it.tags) ? it.tags.filter((t): t is string => typeof t === 'string') : [],
+      visibility_tier: tier,
+      url: typeof it.url === 'string' && it.url.trim() ? it.url.trim() : null,
+      username_hint: typeof it.username_hint === 'string' ? it.username_hint : null,
+      fields,
+    })
+  }
+  return { ok: true, file: { version: 1, items } }
+}
