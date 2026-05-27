@@ -38,12 +38,13 @@ export default function Login() {
         </>
       }
     >
-      <form onSubmit={onSubmit} className="space-y-4">
+      <form onSubmit={onSubmit} className="space-y-4" noValidate>
         <div>
           <label htmlFor="email" className="label">Email</label>
           <input
             id="email"
-            type="email"
+            type="text"
+            inputMode="email"
             className="input"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
