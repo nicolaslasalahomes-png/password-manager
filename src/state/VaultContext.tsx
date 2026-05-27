@@ -17,7 +17,6 @@ import {
   type KdfParams,
 } from '../lib/encryption'
 import { useAuth } from './AuthContext'
-import { maybeSubstituteTestCred } from '../lib/devTest'
 
 export type VaultStatus = 'loading' | 'no-vault' | 'locked' | 'unlocked'
 
@@ -151,9 +150,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const unlockVault = useCallback(
     async (masterPassword: string) => {
       if (!meta) throw new Error('No vault to unlock')
-      // Dev-only: "test" maps to the real master password from .env.local
-      const realMasterPw = maybeSubstituteTestCred(masterPassword, 'masterPassword')
-      const { dek } = await cryptoUnlockVault({ masterPassword: realMasterPw, ...meta })
+      const { dek } = await cryptoUnlockVault({ masterPassword, ...meta })
       if (dekRef.current) zero(dekRef.current)
       dekRef.current = dek
       setStatus('unlocked')
@@ -174,8 +171,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const verifyMasterPassword = useCallback(
     async (masterPassword: string) => {
       if (!meta) return false
-      const realMasterPw = maybeSubstituteTestCred(masterPassword, 'masterPassword')
-      return cryptoVerifyMasterPassword({ masterPassword: realMasterPw, ...meta })
+      return cryptoVerifyMasterPassword({ masterPassword, ...meta })
     },
     [meta],
   )

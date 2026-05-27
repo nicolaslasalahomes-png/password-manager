@@ -88,17 +88,9 @@ The Action builds the `.app`, signs the updater bundle, and creates a GitHub rel
 
 **One-time repo visibility flip:** `nicolassut/password-manager` needs to be **public** so the updater can read the releases manifest without auth. The source has no secrets in it (Supabase keys are env vars, never committed).
 
-### Test backdoor (dev only)
+<!-- Test backdoor removed 2026-05-27 — security-first decision. -->
+<!-- If you ever want it back, see git history at v0.1.2 for the implementation. -->
 
-Typing the literal string `test` in any sign-in or master-password field maps to your real credentials when running `npm run tauri:dev` or `npm run dev`. Set up by adding to `.env.local`:
-
-```
-VITE_DEV_TEST_EMAIL=your-real-email@example.com
-VITE_DEV_TEST_SIGNIN_PASSWORD=your-real-signin-password
-VITE_DEV_TEST_MASTER_PASSWORD=your-real-master-password
-```
-
-These are stripped entirely from production builds (the code path is guarded by `import.meta.env.DEV` which Vite tree-shakes out). They never reach the bundle that gets signed and uploaded by the GitHub Action.
 
 ### What's planned but not yet built
 

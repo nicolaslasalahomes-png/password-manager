@@ -9,7 +9,6 @@ import {
 } from 'react'
 import type { Session, User } from '@supabase/supabase-js'
 import { supabase } from '../lib/supabase'
-import { maybeSubstituteTestCred } from '../lib/devTest'
 
 interface AuthApi {
   user: User | null
@@ -50,13 +49,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const signIn = useCallback(async (email: string, password: string) => {
-    // Dev-only: "test" in either field maps to the real account from .env.local
-    const realEmail = maybeSubstituteTestCred(email, 'email')
-    const realPassword = maybeSubstituteTestCred(password, 'signinPassword')
-    const { error } = await supabase.auth.signInWithPassword({
-      email: realEmail,
-      password: realPassword,
-    })
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
     if (error) throw error
   }, [])
 
