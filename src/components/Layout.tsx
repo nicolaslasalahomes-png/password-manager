@@ -4,23 +4,27 @@ import type { ReactNode } from 'react'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
+import Sidebar from './Sidebar'
 
 interface Props {
   children: ReactNode
   rightSlot?: ReactNode
+  /** Hide the sidebar (e.g. on full-screen forms like ItemNew/ItemView). */
+  hideSidebar?: boolean
 }
 
-export default function Layout({ children, rightSlot }: Props) {
+export default function Layout({ children, rightSlot, hideSidebar }: Props) {
   const { signOut, user } = useAuth()
   const { lockVault } = useVault()
   const toast = useToast()
   const loc = useLocation()
   const onVaultList = loc.pathname === '/vault'
+  const showSidebar = !hideSidebar
 
   return (
     <div className="min-h-full">
       <header className="sticky top-0 z-30 border-b border-ink-800 bg-ink-950/80 backdrop-blur">
-        <div className="mx-auto flex h-14 max-w-5xl items-center gap-3 px-4">
+        <div className="mx-auto flex h-14 max-w-6xl items-center gap-3 px-4">
           <Link to="/vault" className="flex items-center gap-2 text-ink-100">
             <ShieldCheck className="h-5 w-5 text-accent-400" />
             <span className="font-semibold tracking-tight">Keyring</span>
@@ -60,7 +64,10 @@ export default function Layout({ children, rightSlot }: Props) {
           </button>
         </div>
       </header>
-      <main className="mx-auto max-w-5xl px-4 py-6">{children}</main>
+      <div className="mx-auto flex max-w-6xl gap-6 px-4 py-6">
+        {showSidebar && <Sidebar />}
+        <main className="min-w-0 flex-1">{children}</main>
+      </div>
     </div>
   )
 }
