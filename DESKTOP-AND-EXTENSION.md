@@ -78,9 +78,13 @@ The Action builds the `.app`, signs the updater bundle, and creates a GitHub rel
 | Name | Value |
 |---|---|
 | `TAURI_SIGNING_PRIVATE_KEY` | Contents of `~/.tauri/keyring.key` (printed below by the wiring step) |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Empty string (key was generated with no password) |
 | `VITE_SUPABASE_URL` | Same value as in your `.env.local` |
 | `VITE_SUPABASE_ANON_KEY` | Same value as in your `.env.local` |
+
+> **Don't create `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.** GitHub disallows empty
+> secret values. The key was generated with no password, so the workflow's
+> `${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}` reference evaluates to an
+> empty string when the secret is absent — which is what the Tauri signer expects.
 
 **One-time repo visibility flip:** `nicolassut/password-manager` needs to be **public** so the updater can read the releases manifest without auth. The source has no secrets in it (Supabase keys are env vars, never committed).
 

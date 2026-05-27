@@ -4,10 +4,14 @@
 # The installed app reads latest.json on launch to discover new versions.
 #
 # Required GitHub Secrets (Settings → Secrets and variables → Actions):
-#   TAURI_SIGNING_PRIVATE_KEY          — contents of ~/.tauri/keyring.key
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — empty string if the key has no password
-#   VITE_SUPABASE_URL                  — same value as in your local .env.local
-#   VITE_SUPABASE_ANON_KEY             — same value as in your local .env.local
+#   TAURI_SIGNING_PRIVATE_KEY  — contents of ~/.tauri/keyring.key
+#   VITE_SUPABASE_URL          — same value as in your local .env.local
+#   VITE_SUPABASE_ANON_KEY     — same value as in your local .env.local
+#
+# DO NOT create TAURI_SIGNING_PRIVATE_KEY_PASSWORD — GitHub doesn't allow empty
+# secret values, and our key was generated with no password. The `${{ secrets.X }}`
+# reference below evaluates to an empty string when the secret doesn't exist,
+# which is exactly what the Tauri signer expects.
 #
 # Dual-repo note: this workflow only runs on the canonical
 # nicolassut/password-manager repo. The mirror (nicolaslasalahomes-png/…)
