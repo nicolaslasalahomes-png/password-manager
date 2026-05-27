@@ -155,7 +155,7 @@ export default function ItemNew() {
               className="input"
             >
               <option value="low">Low — visible after vault unlock</option>
-              <option value="medium">Medium — reveal needs master password</option>
+              <option value="medium">Medium — blurred, click to reveal</option>
               <option value="high">High — copy only, never shown on screen</option>
             </select>
           </div>

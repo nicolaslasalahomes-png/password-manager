@@ -1,4 +1,4 @@
-import { Eye, EyeOff, KeyRound } from 'lucide-react'
+import { Eye, EyeOff } from 'lucide-react'
 import type { VisibilityTier } from '../lib/items'
 
 const styles: Record<VisibilityTier, string> = {
@@ -9,12 +9,12 @@ const styles: Record<VisibilityTier, string> = {
 
 const labels: Record<VisibilityTier, string> = {
   low: 'Visible',
-  medium: 'Reveal w/ password',
+  medium: 'Click to reveal',
   high: 'Hidden — copy only',
 }
 
 export default function TierBadge({ tier, compact = false }: { tier: VisibilityTier; compact?: boolean }) {
-  const Icon = tier === 'low' ? Eye : tier === 'medium' ? KeyRound : EyeOff
+  const Icon = tier === 'low' || tier === 'medium' ? Eye : EyeOff
   return (
     <span className={`badge ${styles[tier]}`}>
       <Icon size={10} />
