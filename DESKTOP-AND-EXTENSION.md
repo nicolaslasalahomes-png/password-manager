@@ -1,0 +1,111 @@
+# Keyring — Desktop app & browser extension
+
+This repo ships **three surfaces** that all read the same vault from the same Supabase backend:
+
+| Surface | Where | Built from |
+|---|---|---|
+| **Web app** | https://password-manager-nicolaslasalahomes-pngs-projects.vercel.app | `src/` → Vercel |
+| **Mac desktop app** (Tauri) | Native `.app` on your machine | `src/` + `src-tauri/` → `npm run tauri:build` |
+| **Browser extension** | Chrome / Edge / Brave / Arc toolbar | `extension/` → `npm run build:extension` |
+
+All three share the same encrypted items. Sign in once per surface; data syncs automatically.
+
+---
+
+## Desktop app
+
+### Prerequisites (first time only)
+
+- Rust (already installed at `~/.cargo/bin/rustc`)
+- Xcode Command Line Tools (already installed)
+- Node 22.11+ (already installed at `~/.local/node/bin/node`)
+
+### Run in dev mode
+
+```bash
+cd ~/password-manager
+export PATH="$HOME/.cargo/bin:$HOME/.local/node/bin:$PATH"
+npm run tauri:dev
+```
+
+A native window opens, loaded from the Vite dev server. Hot reload works.
+
+### Build a release `.app`
+
+```bash
+npm run tauri:build
+```
+
+The signed-by-you-only `.app` lands at:
+
+```
+src-tauri/target/release/bundle/macos/Keyring.app
+```
+
+Drag it into `/Applications`. First launch: right-click → Open → Open (this bypasses Gatekeeper for an unsigned dev build). Subsequent launches: just click.
+
+### What you get
+
+- **Global hotkey** — set in Settings (sidebar) → first time you unlock the vault on desktop, a wizard prompts you to assign one. Press it from any app → Keyring jumps to front, focused on Quick Add.
+- **Quick Add view** — small focused window. Type tabs (Password / API key / Note / Other), title, value, folder, tier. ⌘↵ to save, Esc to dismiss. After save the window hides for instant follow-up.
+- **Menubar tray icon** — Show / Lock / Settings / Quit.
+- **Close button hides** instead of quits (macOS convention). Quit via tray menu or ⌘Q.
+- **Window state** persists between launches (size, position).
+
+### What's planned but not yet built
+
+- **Touch ID unlock** — Settings shows "Coming soon". Implementing this requires a Rust shim around macOS's `LocalAuthentication` + Keychain Services with `kSecAccessControlBiometryAny`. Tracked as its own follow-up.
+- **Launch on login** toggle — placeholder in Settings.
+- **Auto-hide after save** toggle — currently always on; we can expose if it gets annoying.
+
+---
+
+## Browser extension
+
+### Build
+
+```bash
+cd ~/password-manager
+export PATH="$HOME/.local/node/bin:$PATH"
+npm run build:extension
+```
+
+Output lands at `extension/dist/`. The directory contains everything Chrome needs.
+
+### Install (Chrome / Edge / Brave / Arc)
+
+1. Open `chrome://extensions`
+2. Toggle **Developer mode** on (top right)
+3. Click **Load unpacked**
+4. Pick the `extension/dist/` folder
+5. The Keyring icon appears in your toolbar — pin it for easy access
+
+### Use
+
+1. Click the toolbar icon
+2. Sign in (same email + sign-in password as the web app)
+3. Unlock with master password
+4. Search → click an item → primary field copies to clipboard
+5. Paste into the password field on the page
+
+The session stays unlocked for 10 minutes of extension inactivity, then locks. Closing the browser fully wipes the in-memory session.
+
+### What's planned but not yet built
+
+- **In-page autofill** — a content script that detects `<input type="password">` and offers an inline "Fill with Keyring" button (matched against the item's `url`). Currently you have to open the popup and paste manually.
+- **Firefox / Safari builds** — Chromium-only for now. Firefox needs a manifest tweak; Safari needs Apple's wrapper.
+- **Real icon PNGs** — currently placeholder (the favicon SVG renamed). Replace with proper icon-16/32/48/128 PNGs before any Chrome Web Store submission.
+
+---
+
+## Architecture note
+
+All three surfaces use the same modules under `src/lib/`:
+
+- `encryption.ts` — PBKDF2 + AES-GCM. Master password never leaves the device.
+- `supabase.ts` — single client, same project
+- `items.ts` — CRUD against `vault_items` with RLS
+
+The desktop app imports them directly. The extension imports them through a Vite alias (`@vault/*` → `src/*`).
+
+If you change the encryption module, **every surface needs a rebuild + redeploy**. The web build auto-deploys on push; desktop and extension are manual rebuilds.
