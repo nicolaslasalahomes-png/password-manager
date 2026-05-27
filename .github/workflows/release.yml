@@ -1,0 +1,70 @@
+# Triggered on git tags shaped like v1.2.3.
+# Builds the Tauri .app, signs the updater bundle, and publishes a GitHub
+# release with both the installer AND the updater manifest (latest.json).
+# The installed app reads latest.json on launch to discover new versions.
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY          — contents of ~/.tauri/keyring.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — empty string if the key has no password
+#   VITE_SUPABASE_URL                  — same value as in your local .env.local
+#   VITE_SUPABASE_ANON_KEY             — same value as in your local .env.local
+#
+# Dual-repo note: this workflow only runs on the canonical
+# nicolassut/password-manager repo. The mirror (nicolaslasalahomes-png/…)
+# gets the file too via dual-push but the `if:` guard skips it.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    if: github.repository == 'nicolassut/password-manager'
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Keyring ${{ github.ref_name }}'
+          releaseBody: |
+            Auto-built release. Drag the `.app` into /Applications and right-click → Open the first time.
+
+            Updates from here roll automatically into existing installs.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: false

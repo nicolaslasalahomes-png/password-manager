@@ -145,6 +145,58 @@ export async function setStoreValue<T>(key: string, value: T): Promise<void> {
   }
 }
 
+// ── Auto-update ─────────────────────────────────────────────────────────────
+
+export interface UpdateInfo {
+  available: boolean
+  version?: string
+  currentVersion?: string
+  body?: string
+}
+
+/** Check for a new version. Returns metadata; does not download/install. */
+export async function checkForUpdate(): Promise<UpdateInfo> {
+  if (!isDesktop()) return { available: false }
+  try {
+    const { check } = await import('@tauri-apps/plugin-updater')
+    const { getVersion } = await import('@tauri-apps/api/app')
+    const currentVersion = await getVersion()
+    const update = await check()
+    if (!update) return { available: false, currentVersion }
+    return {
+      available: true,
+      version: update.version,
+      currentVersion,
+      body: update.body,
+    }
+  } catch (err) {
+    console.warn('[desktop] checkForUpdate failed', err)
+    return { available: false }
+  }
+}
+
+/** Download + install the latest update, then ask the OS to relaunch the app. */
+export async function downloadAndInstallUpdate(
+  onProgress?: (downloaded: number, total: number | null) => void,
+): Promise<void> {
+  if (!isDesktop()) return
+  const { check } = await import('@tauri-apps/plugin-updater')
+  const { relaunch } = await import('@tauri-apps/plugin-process')
+  const update = await check()
+  if (!update) return
+  let downloaded = 0
+  let total: number | null = null
+  await update.downloadAndInstall((event) => {
+    if (event.event === 'Started') {
+      total = (event.data?.contentLength as number | undefined) ?? null
+    } else if (event.event === 'Progress') {
+      downloaded += event.data.chunkLength
+      onProgress?.(downloaded, total)
+    }
+  })
+  await relaunch()
+}
+
 // ── Tray menu events ────────────────────────────────────────────────────────
 
 /**

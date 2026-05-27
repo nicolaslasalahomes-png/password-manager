@@ -29,9 +29,20 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/nicolassut/password-manager/releases/latest/download/latest.json"
+      ],
+      "dialog": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcwOURGNjQyQzM2QTA3OTYKUldTV0IyckRRdmFkY0hkRDhVWnhWQTVLaXVVUG5yb3B4QThENFpVaU81WW1nVWFsaDVpUkhsUmEK"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "category": "Productivity",
     "shortDescription": "Personal encrypted vault for passwords and API keys",
     "longDescription": "Keyring is a zero-knowledge password and API key vault. Master password never leaves your device.",

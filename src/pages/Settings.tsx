@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react'
 import {
   AlertTriangle,
   Cpu,
+  Download,
   Eye,
   Fingerprint,
   Keyboard as KeyboardIcon,
+  Loader2,
   LogOut,
   ShieldCheck,
 } from 'lucide-react'
@@ -14,6 +16,8 @@ import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
 import {
+  checkForUpdate,
+  downloadAndInstallUpdate,
   getStoreValue,
   registerHotkey,
   setStoreValue,
@@ -35,6 +39,14 @@ export default function Settings() {
 
   const [hotkey, setHotkey] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const [updateStatus, setUpdateStatus] = useState<
+    | { kind: 'idle' }
+    | { kind: 'checking' }
+    | { kind: 'available'; version: string; current?: string; body?: string }
+    | { kind: 'none'; current?: string }
+    | { kind: 'downloading'; pct: number | null }
+    | { kind: 'error'; message: string }
+  >({ kind: 'idle' })
 
   useEffect(() => {
     if (!isDesktop) {
@@ -143,6 +155,13 @@ export default function Settings() {
                 Coming soon
               </button>
             </Row>
+            <Row
+              label="App updates"
+              hint="Check GitHub Releases for a newer signed build of Keyring."
+              vertical
+            >
+              <UpdateControls status={updateStatus} setStatus={setUpdateStatus} />
+            </Row>
           </Section>
         )}
 
@@ -162,6 +181,101 @@ export default function Settings() {
         )}
       </div>
     </Layout>
+  )
+}
+
+function UpdateControls({
+  status,
+  setStatus,
+}: {
+  status:
+    | { kind: 'idle' }
+    | { kind: 'checking' }
+    | { kind: 'available'; version: string; current?: string; body?: string }
+    | { kind: 'none'; current?: string }
+    | { kind: 'downloading'; pct: number | null }
+    | { kind: 'error'; message: string }
+  setStatus: (s: typeof status) => void
+}) {
+  async function onCheck() {
+    setStatus({ kind: 'checking' })
+    const info = await checkForUpdate()
+    if (info.available && info.version) {
+      setStatus({
+        kind: 'available',
+        version: info.version,
+        current: info.currentVersion,
+        body: info.body,
+      })
+    } else {
+      setStatus({ kind: 'none', current: info.currentVersion })
+    }
+  }
+
+  async function onInstall() {
+    setStatus({ kind: 'downloading', pct: null })
+    try {
+      await downloadAndInstallUpdate((downloaded, total) => {
+        const pct = total ? Math.round((downloaded / total) * 100) : null
+        setStatus({ kind: 'downloading', pct })
+      })
+    } catch (err) {
+      setStatus({ kind: 'error', message: err instanceof Error ? err.message : 'Update failed' })
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      {status.kind === 'idle' && (
+        <button onClick={onCheck} className="btn-secondary self-start !py-1.5 !text-xs">
+          <Download size={12} /> Check for updates
+        </button>
+      )}
+      {status.kind === 'checking' && (
+        <div className="inline-flex items-center gap-2 text-xs text-ink-300">
+          <Loader2 size={12} className="animate-spin" /> Checking…
+        </div>
+      )}
+      {status.kind === 'none' && (
+        <div className="text-xs text-ink-300">
+          You're on the latest version
+          {status.current && <span className="text-ink-500"> ({status.current})</span>}.
+          <button
+            onClick={onCheck}
+            className="ml-2 text-accent-300 hover:text-accent-200"
+          >
+            Re-check
+          </button>
+        </div>
+      )}
+      {status.kind === 'available' && (
+        <div className="space-y-2">
+          <p className="text-xs text-ink-100">
+            Update available: <span className="font-mono">{status.version}</span>
+            {status.current && (
+              <span className="text-ink-500"> (you have {status.current})</span>
+            )}
+          </p>
+          {status.body && (
+            <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded border border-ink-700 bg-ink-800 p-2 text-xs text-ink-200">
+              {status.body}
+            </pre>
+          )}
+          <button onClick={onInstall} className="btn-primary !py-1.5 !text-xs">
+            <Download size={12} /> Install &amp; restart
+          </button>
+        </div>
+      )}
+      {status.kind === 'downloading' && (
+        <div className="inline-flex items-center gap-2 text-xs text-ink-300">
+          <Loader2 size={12} className="animate-spin" />
+          Downloading {status.pct !== null ? `${status.pct}%` : '…'}
+        </div>
+      )}
+      {status.kind === 'error' && (
+        <div className="text-xs text-red-300">{status.message}</div>
+      )}
+    </div>
   )
 }
 
