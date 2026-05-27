@@ -178,6 +178,65 @@ export async function unlockVault(args: VaultUnlockArgs): Promise<{ dek: Uint8Ar
 }
 
 /**
+ * Re-wrap the existing DEK with a new master password.
+ *
+ * Keeps the DEK byte-for-byte the same — so every existing vault_items row
+ * stays decryptable without re-encrypting per-item ciphertext. Only the
+ * vault_users row needs updating: new kdf_salt, new encrypted_dek/iv_dek,
+ * new verifier_ciphertext/iv. kdf_params can stay (or be upgraded later).
+ */
+export async function changeMasterPassword(args: {
+  currentMasterPassword: string
+  newMasterPassword: string
+  kdfSalt: string
+  kdfParams: KdfParams
+  verifierCiphertext: string
+  verifierIv: string
+  encryptedDek: string
+  ivDek: string
+}): Promise<VaultSetupMaterial> {
+  if (args.newMasterPassword.length < 8) {
+    throw new Error('New master password must be at least 8 characters')
+  }
+  // Verifies current password by attempting to decrypt the DEK. Throws on mismatch.
+  const { dek } = await unlockVault({
+    masterPassword: args.currentMasterPassword,
+    kdfSalt: args.kdfSalt,
+    kdfParams: args.kdfParams,
+    verifierCiphertext: args.verifierCiphertext,
+    verifierIv: args.verifierIv,
+    encryptedDek: args.encryptedDek,
+    ivDek: args.ivDek,
+  })
+
+  // Generate fresh salt + derive new KEK
+  const newSalt = randomBytes(SALT_BYTES)
+  const newKek = await deriveKek(args.newMasterPassword, newSalt, DEFAULT_KDF_PARAMS)
+
+  // Re-wrap the SAME dek
+  const newIvDek = randomBytes(IV_BYTES)
+  const newEncryptedDek = await aesGcmEncrypt(newKek, newIvDek, dek)
+
+  // New verifier
+  const newVerifierIv = randomBytes(IV_BYTES)
+  const newVerifierCt = await aesGcmEncrypt(
+    newKek,
+    newVerifierIv,
+    new TextEncoder().encode(VERIFIER_PLAINTEXT),
+  )
+
+  return {
+    encryptedDek: toBase64(newEncryptedDek),
+    ivDek: toBase64(newIvDek),
+    kdfSalt: toBase64(newSalt),
+    kdfParams: DEFAULT_KDF_PARAMS,
+    verifierCiphertext: toBase64(newVerifierCt),
+    verifierIv: toBase64(newVerifierIv),
+    dek, // unchanged; vault stays unlocked
+  }
+}
+
+/**
  * Re-derive the KEK and check the verifier only (no DEK decryption).
  * Used for re-prompting high-tier items.
  */

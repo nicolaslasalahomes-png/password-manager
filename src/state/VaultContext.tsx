@@ -10,6 +10,7 @@ import {
 } from 'react'
 import { supabase } from '../lib/supabase'
 import {
+  changeMasterPassword as cryptoChangeMasterPassword,
   setupVault as cryptoSetupVault,
   unlockVault as cryptoUnlockVault,
   verifyMasterPassword as cryptoVerifyMasterPassword,
@@ -38,6 +39,7 @@ interface VaultApi {
   unlockVault: (masterPassword: string) => Promise<void>
   lockVault: () => void
   verifyMasterPassword: (masterPassword: string) => Promise<boolean>
+  changeMasterPassword: (currentMasterPassword: string, newMasterPassword: string) => Promise<void>
   reload: () => Promise<void>
 }
 
@@ -176,6 +178,47 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     [meta],
   )
 
+  const changeMasterPassword = useCallback(
+    async (currentMasterPassword: string, newMasterPassword: string) => {
+      if (!user || !meta) throw new Error('Vault not loaded')
+      // Derives new salt + KEK, re-wraps DEK. Throws if current pw is wrong.
+      const material = await cryptoChangeMasterPassword({
+        currentMasterPassword,
+        newMasterPassword,
+        ...meta,
+      })
+      // Persist the new wrap to Supabase. If this fails, the local state is
+      // unchanged so the user can still unlock with the old pw.
+      const { error } = await supabase
+        .from('vault_users')
+        .update({
+          encrypted_dek: material.encryptedDek,
+          iv_dek: material.ivDek,
+          kdf_salt: material.kdfSalt,
+          kdf_params: material.kdfParams,
+          verifier_ciphertext: material.verifierCiphertext,
+          verifier_iv: material.verifierIv,
+        })
+        .eq('user_id', user.id)
+      if (error) {
+        zero(material.dek)
+        throw error
+      }
+      // DEK is unchanged (same instance), vault stays unlocked, items still decrypt.
+      // Refresh local meta to the new values.
+      setMeta({
+        encryptedDek: material.encryptedDek,
+        ivDek: material.ivDek,
+        kdfSalt: material.kdfSalt,
+        kdfParams: material.kdfParams,
+        verifierCiphertext: material.verifierCiphertext,
+        verifierIv: material.verifierIv,
+      })
+      forceTick((t) => t + 1)
+    },
+    [user, meta],
+  )
+
   // Wipe DEK on tab close
   useEffect(() => {
     const handler = () => {
@@ -194,11 +237,12 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       unlockVault,
       lockVault,
       verifyMasterPassword,
+      changeMasterPassword,
       reload: loadMeta,
     }),
     // dekRef changes are surfaced via forceTick — meta + status reflect transitions
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [status, meta, setupVault, unlockVault, lockVault, verifyMasterPassword, loadMeta],
+    [status, meta, setupVault, unlockVault, lockVault, verifyMasterPassword, changeMasterPassword, loadMeta],
   )
 
   return <VaultContext.Provider value={api}>{children}</VaultContext.Provider>

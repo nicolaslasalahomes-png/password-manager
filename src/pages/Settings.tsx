@@ -6,11 +6,13 @@ import {
   Eye,
   Fingerprint,
   Keyboard as KeyboardIcon,
+  KeyRound,
   Loader2,
   LogOut,
   ShieldCheck,
 } from 'lucide-react'
 import Layout from '../components/Layout'
+import ChangeMasterPasswordModal from '../components/ChangeMasterPasswordModal'
 import HotkeyRecorder, { comboToGlyph } from '../components/HotkeyRecorder'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
@@ -39,6 +41,7 @@ export default function Settings() {
 
   const [hotkey, setHotkey] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const [changeMasterPwOpen, setChangeMasterPwOpen] = useState(false)
   const [updateStatus, setUpdateStatus] = useState<
     | { kind: 'idle' }
     | { kind: 'checking' }
@@ -118,9 +121,12 @@ export default function Settings() {
               Lock now
             </button>
           </Row>
-          <Row label="Change master password" hint="Re-wraps the data key with the new password.">
-            <button disabled className="btn-secondary !py-1.5 !text-xs opacity-50">
-              Coming soon
+          <Row label="Change master password" hint="Re-wraps the data key with the new password. Items stay decryptable.">
+            <button
+              onClick={() => setChangeMasterPwOpen(true)}
+              className="btn-secondary !py-1.5 !text-xs"
+            >
+              <KeyRound size={12} /> Change…
             </button>
           </Row>
         </Section>
@@ -180,6 +186,10 @@ export default function Settings() {
           </Section>
         )}
       </div>
+
+      {changeMasterPwOpen && (
+        <ChangeMasterPasswordModal onClose={() => setChangeMasterPwOpen(false)} />
+      )}
     </Layout>
   )
 }
