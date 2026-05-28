@@ -18,6 +18,7 @@ import {
   type KdfParams,
 } from '../lib/encryption'
 import { useAuth } from './AuthContext'
+import { clearSessionDek, setSessionDek } from '../lib/desktop'
 
 export type VaultStatus = 'loading' | 'no-vault' | 'locked' | 'unlocked'
 
@@ -135,6 +136,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         throw error
       }
       dekRef.current = material.dek
+      // Mirror to Rust state so the quick-add window can use it.
+      void setSessionDek(material.dek)
       setMeta({
         encryptedDek: material.encryptedDek,
         ivDek: material.ivDek,
@@ -155,6 +158,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       const { dek } = await cryptoUnlockVault({ masterPassword, ...meta })
       if (dekRef.current) zero(dekRef.current)
       dekRef.current = dek
+      void setSessionDek(dek)
       setStatus('unlocked')
       forceTick((t) => t + 1)
     },
@@ -166,6 +170,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       zero(dekRef.current)
       dekRef.current = null
     }
+    void clearSessionDek()
     setStatus((prev) => (prev === 'unlocked' ? 'locked' : prev))
     forceTick((t) => t + 1)
   }, [])

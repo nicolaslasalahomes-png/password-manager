@@ -6,7 +6,7 @@ import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
 import { createItem, listFolders, type ItemType, type VisibilityTier } from '../lib/items'
 import { generatePassword } from '../lib/generate'
-import { exitQuickAddMode, hideWindow, useIsDesktop } from '../lib/desktop'
+import { hideWindow, useIsDesktop } from '../lib/desktop'
 
 const VALUE_FIELD_BY_TYPE: Record<ItemType | string, string> = {
   login: 'password',
@@ -43,20 +43,7 @@ export default function QuickAdd() {
     listFolders().then(setFolderOptions).catch(() => {})
   }, [])
 
-  // Restore the main window to its previous size/position when leaving
-  // quick-add (whichever way the user exits: Esc, Save, "Open full vault",
-  // or navigating elsewhere).
-  useEffect(() => {
-    if (!isDesktop) return
-    return () => {
-      void exitQuickAddMode()
-    }
-  }, [isDesktop])
-
   // Cmd+Enter to save, Esc to dismiss.
-  // On desktop we ALSO navigate to /vault so QuickAdd unmounts → the
-  // cleanup effect above runs exitQuickAddMode → window size/pos restored
-  // before the next time it's shown (dock click, hotkey, etc.).
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {

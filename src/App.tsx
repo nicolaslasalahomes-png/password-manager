@@ -6,11 +6,12 @@ import { useToast } from './state/ToastContext'
 import { useIdleLock } from './lib/useIdleLock'
 import {
   checkForUpdate,
-  enterQuickAddMode,
   getStoreValue,
   isDesktop,
   onTrayEvent,
+  openQuickAddWindow,
   registerHotkey,
+  showWindow,
   unregisterAllHotkeys,
 } from './lib/desktop'
 import Login from './pages/Login'
@@ -111,9 +112,16 @@ function SignedInShell() {
       if (cancelled) return
       if (combo) {
         await registerHotkey(combo, async () => {
-          sessionStorage.setItem(HOTKEY_INTENT_KEY, '/vault/quick-add')
-          await enterQuickAddMode() // resize + dock top-right + show + focus
-          navigate('/vault/quick-add')
+          if (vaultStatus === 'unlocked') {
+            // Vault is unlocked → open the dedicated quick-add window.
+            await openQuickAddWindow()
+          } else {
+            // Vault locked / no vault → bring main window forward so user
+            // can unlock first. After unlock, the consumer effect picks up
+            // the intent and opens quick-add window.
+            sessionStorage.setItem(HOTKEY_INTENT_KEY, 'quick-add-window')
+            await showWindow()
+          }
         })
       } else if (!prompted && vaultStatus === 'unlocked') {
         // First unlocked session — show the wizard
@@ -135,7 +143,11 @@ function SignedInShell() {
     const intent = sessionStorage.getItem(HOTKEY_INTENT_KEY)
     if (intent) {
       sessionStorage.removeItem(HOTKEY_INTENT_KEY)
-      navigate(intent)
+      if (intent === 'quick-add-window' && isDesktop()) {
+        void openQuickAddWindow()
+      } else {
+        navigate(intent)
+      }
     }
   }, [vaultStatus, navigate])
 

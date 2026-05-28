@@ -1,11 +1,47 @@
 // Prevents additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::Mutex;
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
+
+/// In-memory session state shared between windows.
+/// The DEK lives in Rust process memory (never serialized to disk) so the
+/// quick-add window can grab it from the main window without serializing
+/// secret material through the OS clipboard, env, or files.
+#[derive(Default)]
+struct SessionState {
+    dek: Mutex<Option<Vec<u8>>>,
+}
+
+#[tauri::command]
+fn set_session_dek(state: tauri::State<'_, SessionState>, dek: Vec<u8>) {
+    if let Ok(mut guard) = state.dek.lock() {
+        *guard = Some(dek);
+    }
+}
+
+#[tauri::command]
+fn get_session_dek(state: tauri::State<'_, SessionState>) -> Option<Vec<u8>> {
+    state.dek.lock().ok().and_then(|g| g.clone())
+}
+
+#[tauri::command]
+fn clear_session_dek(state: tauri::State<'_, SessionState>) {
+    if let Ok(mut guard) = state.dek.lock() {
+        // Zero the bytes before dropping for hygiene.
+        if let Some(buf) = guard.as_mut() {
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+        }
+        *guard = None;
+    }
+}
 
 /// Bring the main window to the front. Used by tray clicks and global hotkey.
 fn show_main_window(app: &tauri::AppHandle) {
@@ -31,6 +67,7 @@ fn hide_window(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(SessionState::default())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -88,7 +125,13 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![show_window, hide_window])
+        .invoke_handler(tauri::generate_handler![
+            show_window,
+            hide_window,
+            set_session_dek,
+            get_session_dek,
+            clear_session_dek
+        ])
         .on_window_event(|window, event| {
             // Close button hides the window (like macOS apps), doesn't quit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

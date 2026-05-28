@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default Keyring permissions",
-  "windows": ["main"],
+  "windows": ["main", "quick-add"],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -16,6 +16,7 @@
     "core:window:allow-outer-position",
     "core:window:allow-scale-factor",
     "core:window:allow-primary-monitor",
+    "core:webview:allow-create-webview-window",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "global-shortcut:allow-register",

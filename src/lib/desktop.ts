@@ -106,78 +106,135 @@ export async function hideWindow(): Promise<void> {
   }
 }
 
-// ── Quick-add popover mode ──────────────────────────────────────────────────
-// Resize the window to a small popover, dock top-right, then restore on exit.
-// Done as window-resize rather than a separate Tauri window so the React tree
-// (auth + unlocked DEK) doesn't need to be duplicated or shared across windows.
+// ── Separate quick-add window ───────────────────────────────────────────────
+// A dedicated borderless mini-window for the hotkey. Shares the unlocked DEK
+// with the main window via a Rust-owned session state (set_session_dek /
+// get_session_dek commands), so the popover can encrypt + insert items
+// without re-prompting for the master password.
 
-interface SavedWindowState {
-  width: number
-  height: number
-  x: number
-  y: number
+const QUICK_ADD_LABEL = 'quick-add'
+const QUICK_ADD_WIDTH = 480
+const QUICK_ADD_HEIGHT = 560
+const QUICK_ADD_EDGE_PADDING = 24
+
+/** Get the current label of the window we're running in (e.g. "main" or "quick-add"). */
+export async function getWindowLabel(): Promise<string | null> {
+  if (!isDesktop()) return null
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    return getCurrentWindow().label
+  } catch {
+    return null
+  }
 }
 
-let savedWindowState: SavedWindowState | null = null
+/** Synchronous label check via the URL hash — used at render time before async
+ *  Tauri APIs are available. The quick-add window is loaded with #quick-add. */
+export function isQuickAddWindowSync(): boolean {
+  return typeof window !== 'undefined' && window.location.hash === '#quick-add'
+}
 
-const POPOVER_WIDTH = 480
-const POPOVER_HEIGHT = 560
-const POPOVER_EDGE_PADDING = 24
-
-export async function enterQuickAddMode(): Promise<void> {
+/** Show the quick-add window. Creates it on first call; shows + focuses on subsequent. */
+export async function openQuickAddWindow(): Promise<void> {
   if (!isDesktop()) return
   try {
-    const { getCurrentWindow, PhysicalPosition, PhysicalSize, primaryMonitor } = await import(
-      '@tauri-apps/api/window'
-    )
-    const w = getCurrentWindow()
-    const scaleFactor = await w.scaleFactor()
+    const { WebviewWindow, getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
+    const { primaryMonitor } = await import('@tauri-apps/api/window')
 
-    // Save current — only if we don't already have a saved state (re-entry).
-    if (!savedWindowState) {
-      const size = await w.outerSize()
-      const pos = await w.outerPosition()
-      savedWindowState = {
-        width: size.width,
-        height: size.height,
-        x: pos.x,
-        y: pos.y,
-      }
+    const existing = (await getAllWebviewWindows()).find((w) => w.label === QUICK_ADD_LABEL)
+    if (existing) {
+      await existing.show()
+      await existing.unminimize()
+      await existing.setFocus()
+      return
     }
 
-    // Position top-right of the primary monitor
+    // Position top-right of primary monitor
     const monitor = await primaryMonitor()
     const monW = monitor?.size.width ?? 1920
     const monX = monitor?.position.x ?? 0
     const monY = monitor?.position.y ?? 0
+    const scaleFactor = monitor?.scaleFactor ?? 1
+    const logicalW = monW / scaleFactor
 
-    const targetW = Math.round(POPOVER_WIDTH * scaleFactor)
-    const targetH = Math.round(POPOVER_HEIGHT * scaleFactor)
-    const targetX = monX + monW - targetW - Math.round(POPOVER_EDGE_PADDING * scaleFactor)
-    const targetY = monY + Math.round(POPOVER_EDGE_PADDING * scaleFactor)
+    const x = Math.round(monX / scaleFactor + logicalW - QUICK_ADD_WIDTH - QUICK_ADD_EDGE_PADDING)
+    const y = Math.round(monY / scaleFactor + QUICK_ADD_EDGE_PADDING)
 
-    await w.setSize(new PhysicalSize(targetW, targetH))
-    await w.setPosition(new PhysicalPosition(targetX, targetY))
-    await w.show()
-    await w.setFocus()
+    const w = new WebviewWindow(QUICK_ADD_LABEL, {
+      url: 'index.html#quick-add',
+      title: 'Quick Add',
+      width: QUICK_ADD_WIDTH,
+      height: QUICK_ADD_HEIGHT,
+      x,
+      y,
+      resizable: false,
+      decorations: false,
+      transparent: false,
+      shadow: true,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      focus: true,
+      visible: false, // we'll show after content loads to avoid flash
+    })
+
+    w.once('tauri://created', () => {
+      void w.show()
+      void w.setFocus()
+    })
+    w.once('tauri://error', (e) => {
+      console.warn('[desktop] quick-add window error', e)
+    })
   } catch (err) {
-    console.warn('[desktop] enterQuickAddMode failed', err)
+    console.warn('[desktop] openQuickAddWindow failed', err)
   }
 }
 
-export async function exitQuickAddMode(): Promise<void> {
+/** Hide (not destroy) the quick-add window. */
+export async function closeQuickAddWindow(): Promise<void> {
   if (!isDesktop()) return
-  if (!savedWindowState) return
   try {
-    const { getCurrentWindow, PhysicalPosition, PhysicalSize } = await import(
-      '@tauri-apps/api/window'
-    )
-    const w = getCurrentWindow()
-    await w.setSize(new PhysicalSize(savedWindowState.width, savedWindowState.height))
-    await w.setPosition(new PhysicalPosition(savedWindowState.x, savedWindowState.y))
-    savedWindowState = null
+    const { getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
+    const w = (await getAllWebviewWindows()).find((x) => x.label === QUICK_ADD_LABEL)
+    if (w) await w.hide()
   } catch (err) {
-    console.warn('[desktop] exitQuickAddMode failed', err)
+    console.warn('[desktop] closeQuickAddWindow failed', err)
+  }
+}
+
+// ── Session DEK shared via Rust state ───────────────────────────────────────
+
+/** Push the unlocked DEK into Rust process memory so other windows can grab it. */
+export async function setSessionDek(dek: Uint8Array): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('set_session_dek', { dek: Array.from(dek) })
+  } catch (err) {
+    console.warn('[desktop] setSessionDek failed', err)
+  }
+}
+
+/** Read the session DEK from Rust. Returns null if vault is locked or not on desktop. */
+export async function getSessionDek(): Promise<Uint8Array | null> {
+  if (!isDesktop()) return null
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const result = (await invoke('get_session_dek')) as number[] | null
+    return result ? new Uint8Array(result) : null
+  } catch (err) {
+    console.warn('[desktop] getSessionDek failed', err)
+    return null
+  }
+}
+
+/** Clear the session DEK (called on lock or sign-out). */
+export async function clearSessionDek(): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('clear_session_dek')
+  } catch (err) {
+    console.warn('[desktop] clearSessionDek failed', err)
   }
 }
 
