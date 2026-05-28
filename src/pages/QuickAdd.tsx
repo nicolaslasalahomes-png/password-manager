@@ -53,13 +53,22 @@ export default function QuickAdd() {
     }
   }, [isDesktop])
 
-  // Cmd+Enter to save, Esc to dismiss
+  // Cmd+Enter to save, Esc to dismiss.
+  // On desktop we ALSO navigate to /vault so QuickAdd unmounts → the
+  // cleanup effect above runs exitQuickAddMode → window size/pos restored
+  // before the next time it's shown (dock click, hotkey, etc.).
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
-        if (isDesktop) void hideWindow()
-        else navigate('/vault')
+        if (isDesktop) {
+          void (async () => {
+            await hideWindow()
+            navigate('/vault')
+          })()
+        } else {
+          navigate('/vault')
+        }
       }
     }
     window.addEventListener('keydown', handler)
@@ -95,11 +104,13 @@ export default function QuickAdd() {
       )
       toast.success('Saved')
       if (isDesktop) {
-        // Reset for a follow-up entry, then hide
+        // Reset for a follow-up entry, hide, then navigate so QuickAdd
+        // unmounts and the window size/pos is restored (see cleanup effect).
         setTitle('')
         setUsername('')
         setValue('')
         await hideWindow()
+        navigate('/vault')
       } else {
         navigate('/vault')
       }

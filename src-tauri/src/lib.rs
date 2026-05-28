@@ -96,6 +96,16 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // macOS dock-click on an app with no visible windows: show the main
+            // window. Without this, clicking the dock icon does nothing because
+            // we keep the process alive after the user closes/hides the window.
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    show_main_window(app);
+                }
+            }
+        });
 }
