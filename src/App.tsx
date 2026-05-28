@@ -27,16 +27,10 @@ import HotkeyFirstRunModal from './components/HotkeyFirstRunModal'
 import UpdateBanner from './components/UpdateBanner'
 import FullPageLoader from './components/FullPageLoader'
 
+const HOTKEY_INTENT_KEY = 'keyring-hotkey-intent'
+
 export default function App() {
   const { user, loading: authLoading } = useAuth()
-  const { status: vaultStatus, lockVault } = useVault()
-  const toast = useToast()
-
-  // Auto-lock after 10min idle or on tab hide
-  const onIdle = useCallback(() => {
-    if (vaultStatus === 'unlocked') lockVault()
-  }, [vaultStatus, lockVault])
-  useIdleLock(vaultStatus === 'unlocked', onIdle)
 
   if (authLoading) return <FullPageLoader label="Loading session…" />
 
@@ -51,54 +45,14 @@ export default function App() {
     )
   }
 
-  if (vaultStatus === 'loading') return <FullPageLoader label="Loading vault…" />
-
-  // Signed in but no vault yet → setup
-  if (vaultStatus === 'no-vault') {
-    return (
-      <Routes>
-        <Route path="/setup" element={<VaultSetup />} />
-        <Route path="*" element={<Navigate to="/setup" replace />} />
-      </Routes>
-    )
-  }
-
-  // Signed in, vault exists but locked → unlock
-  if (vaultStatus === 'locked') {
-    return (
-      <Routes>
-        <Route path="/unlock" element={<VaultUnlock />} />
-        <Route path="*" element={<Navigate to="/unlock" replace />} />
-      </Routes>
-    )
-  }
-
-  // Fully unlocked — render main routes + desktop-only side effects
-  return (
-    <UnlockedShell toast={toast} lockVault={lockVault}>
-      <Routes>
-        <Route path="/vault" element={<VaultList />} />
-        <Route path="/vault/new" element={<ItemNew />} />
-        <Route path="/vault/import" element={<VaultImport />} />
-        <Route path="/vault/quick-add" element={<QuickAdd />} />
-        <Route path="/vault/settings" element={<Settings />} />
-        <Route path="/vault/:id" element={<ItemView />} />
-        <Route path="*" element={<Navigate to="/vault" replace />} />
-      </Routes>
-    </UnlockedShell>
-  )
+  // Signed-in shell — owns hotkey, tray, auto-lock, auto-update.
+  // All of these need to survive vault lock/unlock cycles.
+  return <SignedInShell />
 }
 
-/** Runs effects that only make sense once vault is unlocked AND we're on desktop. */
-function UnlockedShell({
-  children,
-  toast,
-  lockVault,
-}: {
-  children: React.ReactNode
-  toast: ReturnType<typeof useToast>
-  lockVault: () => void
-}) {
+function SignedInShell() {
+  const { status: vaultStatus, lockVault } = useVault()
+  const toast = useToast()
   const navigate = useNavigate()
   const [showFirstRun, setShowFirstRun] = useState(false)
   const [updateInfo, setUpdateInfo] = useState<{ version: string; currentVersion?: string } | null>(
@@ -106,7 +60,21 @@ function UnlockedShell({
   )
   const [bannerDismissed, setBannerDismissed] = useState(false)
 
-  // Re-register the saved hotkey on every unlocked-mount (or never on web)
+  // Auto-lock on idle. On desktop, only by real inactivity timer — NOT on
+  // visibility-hidden (which fires when the user closes the window, clicks
+  // off, or we hide after quick-add save). Web keeps lock-on-hide.
+  const onIdle = useCallback(() => {
+    if (vaultStatus === 'unlocked') {
+      lockVault()
+      toast.info('Vault locked after inactivity')
+    }
+  }, [vaultStatus, lockVault, toast])
+  useIdleLock(vaultStatus === 'unlocked', onIdle)
+
+  // Global hotkey — registered while signed in regardless of vault state.
+  // When pressed while locked, the navigate to /vault/quick-add gets
+  // redirected to /unlock by the routing below; we set a session intent so
+  // we resume the quick-add intent after unlock completes.
   useEffect(() => {
     if (!isDesktop()) return
     let cancelled = false
@@ -116,10 +84,11 @@ function UnlockedShell({
       if (cancelled) return
       if (combo) {
         await registerHotkey(combo, async () => {
+          sessionStorage.setItem(HOTKEY_INTENT_KEY, '/vault/quick-add')
           await showWindow()
           navigate('/vault/quick-add')
         })
-      } else if (!prompted) {
+      } else if (!prompted && vaultStatus === 'unlocked') {
         // First unlocked session — show the wizard
         setShowFirstRun(true)
       }
@@ -128,11 +97,23 @@ function UnlockedShell({
       cancelled = true
       void unregisterAllHotkeys()
     }
+    // We intentionally don't re-register on every render. vaultStatus is
+    // only read for the first-run wizard gating.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Background check for updates once per launch (silent — only surfaces if
-  // an update exists, and only on desktop).
+  // When vault transitions to unlocked, consume any pending hotkey intent.
+  useEffect(() => {
+    if (vaultStatus !== 'unlocked') return
+    const intent = sessionStorage.getItem(HOTKEY_INTENT_KEY)
+    if (intent) {
+      sessionStorage.removeItem(HOTKEY_INTENT_KEY)
+      navigate(intent)
+    }
+  }, [vaultStatus, navigate])
+
+  // Background check for updates once per launch (silent — only surfaces
+  // if an update exists, and only on desktop).
   useEffect(() => {
     if (!isDesktop()) return
     let cancelled = false
@@ -165,16 +146,48 @@ function UnlockedShell({
     }
   }, [lockVault, toast, navigate])
 
+  // Vault state → routing
+  let inner: React.ReactNode
+  if (vaultStatus === 'loading') {
+    inner = <FullPageLoader label="Loading vault…" />
+  } else if (vaultStatus === 'no-vault') {
+    inner = (
+      <Routes>
+        <Route path="/setup" element={<VaultSetup />} />
+        <Route path="*" element={<Navigate to="/setup" replace />} />
+      </Routes>
+    )
+  } else if (vaultStatus === 'locked') {
+    inner = (
+      <Routes>
+        <Route path="/unlock" element={<VaultUnlock />} />
+        <Route path="*" element={<Navigate to="/unlock" replace />} />
+      </Routes>
+    )
+  } else {
+    inner = (
+      <Routes>
+        <Route path="/vault" element={<VaultList />} />
+        <Route path="/vault/new" element={<ItemNew />} />
+        <Route path="/vault/import" element={<VaultImport />} />
+        <Route path="/vault/quick-add" element={<QuickAdd />} />
+        <Route path="/vault/settings" element={<Settings />} />
+        <Route path="/vault/:id" element={<ItemView />} />
+        <Route path="*" element={<Navigate to="/vault" replace />} />
+      </Routes>
+    )
+  }
+
   return (
     <>
-      {updateInfo && !bannerDismissed && (
+      {updateInfo && !bannerDismissed && vaultStatus === 'unlocked' && (
         <UpdateBanner
           version={updateInfo.version}
           currentVersion={updateInfo.currentVersion}
           onDismiss={() => setBannerDismissed(true)}
         />
       )}
-      {children}
+      {inner}
       {showFirstRun && <HotkeyFirstRunModal onDismiss={() => setShowFirstRun(false)} />}
     </>
   )
