@@ -42,6 +42,7 @@ export default function Settings() {
   const [hotkey, setHotkey] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [changeMasterPwOpen, setChangeMasterPwOpen] = useState(false)
+  const [idleTimeoutMin, setIdleTimeoutMin] = useState<number>(30)
   const [updateStatus, setUpdateStatus] = useState<
     | { kind: 'idle' }
     | { kind: 'checking' }
@@ -56,11 +57,29 @@ export default function Settings() {
       setLoaded(true)
       return
     }
-    getStoreValue<string>(HOTKEY_STORE_KEY).then((v) => {
-      setHotkey(v)
+    Promise.all([
+      getStoreValue<string>(HOTKEY_STORE_KEY),
+      getStoreValue<number>('idleLockTimeoutMin'),
+    ]).then(([h, t]) => {
+      setHotkey(h)
+      if (typeof t === 'number') setIdleTimeoutMin(t)
       setLoaded(true)
     })
   }, [isDesktop])
+
+  async function changeIdleTimeout(minutes: number) {
+    setIdleTimeoutMin(minutes)
+    await setStoreValue('idleLockTimeoutMin', minutes)
+    // Notify App.tsx so the useIdleLock hook reconfigures immediately
+    window.dispatchEvent(
+      new CustomEvent<number>('keyring:idle-timeout-changed', { detail: minutes }),
+    )
+    toast.success(
+      minutes === 0
+        ? 'Auto-lock disabled'
+        : `Vault will auto-lock after ${minutes} min of inactivity`,
+    )
+  }
 
   async function saveHotkey(combo: string | null) {
     setHotkey(combo)
@@ -128,6 +147,30 @@ export default function Settings() {
             >
               <KeyRound size={12} /> Change…
             </button>
+          </Row>
+          <Row
+            label="Auto-lock after inactivity"
+            hint={
+              idleTimeoutMin === 0
+                ? 'Vault never locks automatically. You can still lock manually.'
+                : `Vault locks if you don't interact with it for ${idleTimeoutMin} minutes.`
+            }
+          >
+            <select
+              value={idleTimeoutMin}
+              onChange={(e) => void changeIdleTimeout(Number(e.target.value))}
+              className="input w-auto !py-1.5 !text-xs"
+            >
+              <option value={1}>1 minute</option>
+              <option value={5}>5 minutes</option>
+              <option value={10}>10 minutes</option>
+              <option value={15}>15 minutes</option>
+              <option value={30}>30 minutes (default)</option>
+              <option value={60}>1 hour</option>
+              <option value={240}>4 hours</option>
+              <option value={480}>8 hours</option>
+              <option value={0}>Never</option>
+            </select>
           </Row>
         </Section>
 

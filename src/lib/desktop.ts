@@ -106,6 +106,81 @@ export async function hideWindow(): Promise<void> {
   }
 }
 
+// ── Quick-add popover mode ──────────────────────────────────────────────────
+// Resize the window to a small popover, dock top-right, then restore on exit.
+// Done as window-resize rather than a separate Tauri window so the React tree
+// (auth + unlocked DEK) doesn't need to be duplicated or shared across windows.
+
+interface SavedWindowState {
+  width: number
+  height: number
+  x: number
+  y: number
+}
+
+let savedWindowState: SavedWindowState | null = null
+
+const POPOVER_WIDTH = 480
+const POPOVER_HEIGHT = 560
+const POPOVER_EDGE_PADDING = 24
+
+export async function enterQuickAddMode(): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { getCurrentWindow, PhysicalPosition, PhysicalSize, primaryMonitor } = await import(
+      '@tauri-apps/api/window'
+    )
+    const w = getCurrentWindow()
+    const scaleFactor = await w.scaleFactor()
+
+    // Save current — only if we don't already have a saved state (re-entry).
+    if (!savedWindowState) {
+      const size = await w.outerSize()
+      const pos = await w.outerPosition()
+      savedWindowState = {
+        width: size.width,
+        height: size.height,
+        x: pos.x,
+        y: pos.y,
+      }
+    }
+
+    // Position top-right of the primary monitor
+    const monitor = await primaryMonitor()
+    const monW = monitor?.size.width ?? 1920
+    const monX = monitor?.position.x ?? 0
+    const monY = monitor?.position.y ?? 0
+
+    const targetW = Math.round(POPOVER_WIDTH * scaleFactor)
+    const targetH = Math.round(POPOVER_HEIGHT * scaleFactor)
+    const targetX = monX + monW - targetW - Math.round(POPOVER_EDGE_PADDING * scaleFactor)
+    const targetY = monY + Math.round(POPOVER_EDGE_PADDING * scaleFactor)
+
+    await w.setSize(new PhysicalSize(targetW, targetH))
+    await w.setPosition(new PhysicalPosition(targetX, targetY))
+    await w.show()
+    await w.setFocus()
+  } catch (err) {
+    console.warn('[desktop] enterQuickAddMode failed', err)
+  }
+}
+
+export async function exitQuickAddMode(): Promise<void> {
+  if (!isDesktop()) return
+  if (!savedWindowState) return
+  try {
+    const { getCurrentWindow, PhysicalPosition, PhysicalSize } = await import(
+      '@tauri-apps/api/window'
+    )
+    const w = getCurrentWindow()
+    await w.setSize(new PhysicalSize(savedWindowState.width, savedWindowState.height))
+    await w.setPosition(new PhysicalPosition(savedWindowState.x, savedWindowState.y))
+    savedWindowState = null
+  } catch (err) {
+    console.warn('[desktop] exitQuickAddMode failed', err)
+  }
+}
+
 // ── Persistent key/value store (for hotkey + Touch ID prefs) ────────────────
 
 let storePromise: Promise<unknown> | null = null

@@ -6,11 +6,11 @@ import { useToast } from './state/ToastContext'
 import { useIdleLock } from './lib/useIdleLock'
 import {
   checkForUpdate,
+  enterQuickAddMode,
   getStoreValue,
   isDesktop,
   onTrayEvent,
   registerHotkey,
-  showWindow,
   unregisterAllHotkeys,
 } from './lib/desktop'
 import Login from './pages/Login'
@@ -28,6 +28,8 @@ import UpdateBanner from './components/UpdateBanner'
 import FullPageLoader from './components/FullPageLoader'
 
 const HOTKEY_INTENT_KEY = 'keyring-hotkey-intent'
+const IDLE_TIMEOUT_STORE_KEY = 'idleLockTimeoutMin'
+const DEFAULT_IDLE_TIMEOUT_MIN = 30 // desktop default; web fallback inside the hook
 
 export default function App() {
   const { user, loading: authLoading } = useAuth()
@@ -59,6 +61,26 @@ function SignedInShell() {
     null,
   )
   const [bannerDismissed, setBannerDismissed] = useState(false)
+  // -1 = not yet loaded from store; 0 = "Never lock"; >0 = minutes.
+  const [idleTimeoutMin, setIdleTimeoutMin] = useState<number>(-1)
+
+  // Load persisted idle-lock timeout (desktop only — web uses hook default)
+  useEffect(() => {
+    if (!isDesktop()) {
+      setIdleTimeoutMin(DEFAULT_IDLE_TIMEOUT_MIN)
+      return
+    }
+    getStoreValue<number>(IDLE_TIMEOUT_STORE_KEY).then((v) => {
+      setIdleTimeoutMin(typeof v === 'number' ? v : DEFAULT_IDLE_TIMEOUT_MIN)
+    })
+    // Listen for cross-component setting changes via custom event
+    const onSettingChange = (e: Event) => {
+      const ce = e as CustomEvent<number>
+      setIdleTimeoutMin(ce.detail)
+    }
+    window.addEventListener('keyring:idle-timeout-changed', onSettingChange)
+    return () => window.removeEventListener('keyring:idle-timeout-changed', onSettingChange)
+  }, [])
 
   // Auto-lock on idle. On desktop, only by real inactivity timer — NOT on
   // visibility-hidden (which fires when the user closes the window, clicks
@@ -69,7 +91,12 @@ function SignedInShell() {
       toast.info('Vault locked after inactivity')
     }
   }, [vaultStatus, lockVault, toast])
-  useIdleLock(vaultStatus === 'unlocked', onIdle)
+  // 0 = Never (disable hook entirely); >0 = minutes; -1 = still loading
+  const idleActive =
+    vaultStatus === 'unlocked' && idleTimeoutMin !== -1 && idleTimeoutMin !== 0
+  useIdleLock(idleActive, onIdle, {
+    timeoutMs: idleTimeoutMin > 0 ? idleTimeoutMin * 60 * 1000 : undefined,
+  })
 
   // Global hotkey — registered while signed in regardless of vault state.
   // When pressed while locked, the navigate to /vault/quick-add gets
@@ -85,7 +112,7 @@ function SignedInShell() {
       if (combo) {
         await registerHotkey(combo, async () => {
           sessionStorage.setItem(HOTKEY_INTENT_KEY, '/vault/quick-add')
-          await showWindow()
+          await enterQuickAddMode() // resize + dock top-right + show + focus
           navigate('/vault/quick-add')
         })
       } else if (!prompted && vaultStatus === 'unlocked') {
