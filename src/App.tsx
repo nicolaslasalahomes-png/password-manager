@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import { useAuth } from './state/AuthContext'
 import { useVault } from './state/VaultContext'
@@ -57,6 +57,14 @@ function SignedInShell() {
   const { status: vaultStatus, lockVault } = useVault()
   const toast = useToast()
   const navigate = useNavigate()
+
+  // Keep a live ref to vaultStatus so the (mount-once) hotkey handler can
+  // always see the current value — not the stale 'locked'/'loading' state
+  // captured at the moment the handler was registered.
+  const vaultStatusRef = useRef(vaultStatus)
+  useEffect(() => {
+    vaultStatusRef.current = vaultStatus
+  }, [vaultStatus])
   const [showFirstRun, setShowFirstRun] = useState(false)
   const [updateInfo, setUpdateInfo] = useState<{ version: string; currentVersion?: string } | null>(
     null,
@@ -112,8 +120,8 @@ function SignedInShell() {
       if (cancelled) return
       if (combo) {
         await registerHotkey(combo, async () => {
-          if (vaultStatus === 'unlocked') {
-            // Vault is unlocked → open the dedicated quick-add window.
+          // Read live status from ref (avoids stale-closure bug).
+          if (vaultStatusRef.current === 'unlocked') {
             await openQuickAddWindow()
           } else {
             // Vault locked / no vault → bring main window forward so user

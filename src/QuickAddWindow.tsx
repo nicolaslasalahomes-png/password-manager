@@ -86,9 +86,15 @@ function QuickAddWindowInner() {
   }
 
   return (
-    <div className="flex h-screen flex-col bg-ink-950 text-ink-100">
+    // The outer container is a drag region so the user can grab anywhere in
+    // the dark space (header, padding around form, etc). Inputs and buttons
+    // stop being drag regions because they're interactive.
+    <div
+      data-tauri-drag-region
+      className="flex h-screen flex-col bg-ink-950 text-ink-100"
+    >
       <Header />
-      <div className="flex-1 overflow-y-auto p-4">
+      <div data-tauri-drag-region className="flex-1 overflow-y-auto p-4">
         {phase.kind === 'loading' && (
           <p className="text-center text-sm text-ink-300 py-8">Loading…</p>
         )}
@@ -117,14 +123,17 @@ function Header() {
   return (
     <header
       data-tauri-drag-region
-      className="flex items-center gap-2 border-b border-ink-800 px-4 py-2.5"
+      className="flex select-none items-center gap-2 border-b border-ink-800 px-4 py-2.5"
     >
-      <div className="flex h-7 w-7 items-center justify-center rounded-md bg-accent-600/15 text-accent-300">
+      <div
+        data-tauri-drag-region
+        className="pointer-events-none flex h-7 w-7 items-center justify-center rounded-md bg-accent-600/15 text-accent-300"
+      >
         <ShieldCheck size={14} />
       </div>
-      <div className="min-w-0 flex-1">
+      <div data-tauri-drag-region className="pointer-events-none min-w-0 flex-1">
         <p className="text-sm font-semibold text-ink-50 leading-tight">Quick add</p>
-        <p className="text-[10px] text-ink-400 leading-tight">⌘↵ save · Esc close</p>
+        <p className="text-[10px] text-ink-400 leading-tight">⌘↵ save · Esc close · drag here to move</p>
       </div>
       <button
         onClick={() => void closeQuickAddWindow()}

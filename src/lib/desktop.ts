@@ -140,6 +140,11 @@ export async function openQuickAddWindow(): Promise<void> {
   try {
     const { WebviewWindow, getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
     const { primaryMonitor } = await import('@tauri-apps/api/window')
+    const { invoke } = await import('@tauri-apps/api/core')
+
+    // Snapshot whether main is visible. The popover-close handler reads this
+    // to decide whether to deactivate the app on dismiss.
+    await invoke('record_main_visibility')
 
     const existing = (await getAllWebviewWindows()).find((w) => w.label === QUICK_ADD_LABEL)
     if (existing) {
@@ -189,13 +194,15 @@ export async function openQuickAddWindow(): Promise<void> {
   }
 }
 
-/** Hide (not destroy) the quick-add window. */
+/** Dismiss the quick-add popover. The Rust side handles the focus dance —
+ *  if main was up before the popover, focus returns to main; if main was
+ *  hidden, the app deactivates and focus returns to whatever app was active
+ *  before the popover came forward (Lovable, browser, etc.). */
 export async function closeQuickAddWindow(): Promise<void> {
   if (!isDesktop()) return
   try {
-    const { getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
-    const w = (await getAllWebviewWindows()).find((x) => x.label === QUICK_ADD_LABEL)
-    if (w) await w.hide()
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('handle_popover_close')
   } catch (err) {
     console.warn('[desktop] closeQuickAddWindow failed', err)
   }
