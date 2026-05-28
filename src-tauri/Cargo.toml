@@ -1,6 +1,6 @@
 [package]
 name = "keyring-desktop"
-version = "0.1.9"
+version = "0.1.10"
 description = "Keyring — personal encrypted vault"
 authors = ["Nicolas Sutcliffe"]
 license = ""

@@ -24,6 +24,11 @@ on:
     tags:
       - 'v*'
 
+# GITHUB_TOKEN defaults to read-only on public repos. tauri-action needs
+# write access to create the release + upload .app / .dmg / latest.json.
+permissions:
+  contents: write
+
 jobs:
   release:
     if: github.repository == 'nicolassut/password-manager'
