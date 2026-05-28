@@ -5,6 +5,7 @@ import { useVault } from './state/VaultContext'
 import { useToast } from './state/ToastContext'
 import { useIdleLock } from './lib/useIdleLock'
 import {
+  checkForUpdate,
   getStoreValue,
   isDesktop,
   onTrayEvent,
@@ -23,6 +24,7 @@ import VaultImport from './pages/VaultImport'
 import QuickAdd from './pages/QuickAdd'
 import Settings from './pages/Settings'
 import HotkeyFirstRunModal from './components/HotkeyFirstRunModal'
+import UpdateBanner from './components/UpdateBanner'
 import FullPageLoader from './components/FullPageLoader'
 
 export default function App() {
@@ -99,6 +101,10 @@ function UnlockedShell({
 }) {
   const navigate = useNavigate()
   const [showFirstRun, setShowFirstRun] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<{ version: string; currentVersion?: string } | null>(
+    null,
+  )
+  const [bannerDismissed, setBannerDismissed] = useState(false)
 
   // Re-register the saved hotkey on every unlocked-mount (or never on web)
   useEffect(() => {
@@ -125,6 +131,22 @@ function UnlockedShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Background check for updates once per launch (silent — only surfaces if
+  // an update exists, and only on desktop).
+  useEffect(() => {
+    if (!isDesktop()) return
+    let cancelled = false
+    void checkForUpdate().then((info) => {
+      if (cancelled) return
+      if (info.available && info.version) {
+        setUpdateInfo({ version: info.version, currentVersion: info.currentVersion })
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // Tray menu items → app actions
   useEffect(() => {
     if (!isDesktop()) return
@@ -145,6 +167,13 @@ function UnlockedShell({
 
   return (
     <>
+      {updateInfo && !bannerDismissed && (
+        <UpdateBanner
+          version={updateInfo.version}
+          currentVersion={updateInfo.currentVersion}
+          onDismiss={() => setBannerDismissed(true)}
+        />
+      )}
       {children}
       {showFirstRun && <HotkeyFirstRunModal onDismiss={() => setShowFirstRun(false)} />}
     </>
