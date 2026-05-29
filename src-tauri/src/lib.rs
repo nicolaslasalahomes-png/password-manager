@@ -37,19 +37,18 @@ mod macos_focus {
         }
     }
 
-    /// Equivalent of `[NSApp deactivate]` — gives focus back to the previous
-    /// app without hiding any of our windows. The crucial difference from
-    /// tauri's `app.hide()` (which calls `[NSApp hide:]` and ALSO hides
-    /// all windows): deactivate only changes focus.
-    pub fn deactivate_app() {
-        unsafe {
-            let app_class = class!(NSApplication);
-            let app: *mut AnyObject = msg_send![app_class, sharedApplication];
-            if app.is_null() {
-                return;
-            }
-            let _: () = msg_send![app, deactivate];
-        }
+    /// Send Keyring to the background via the same keystroke the user
+    /// would press themselves (Cmd+H = Hide Application). This is the
+    /// most reliable way we've found — `[NSApp deactivate]` doesn't
+    /// always take effect in newer macOS versions, and `[NSApp hide:]`
+    /// works but is brittle when invoked from non-event-loop contexts.
+    pub fn hide_app_via_keystroke() {
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"System Events\" to keystroke \"h\" using command down",
+            ])
+            .spawn();
     }
 }
 
@@ -122,18 +121,29 @@ fn clear_session_dek(state: tauri::State<'_, SessionState>) {
 }
 
 /// Called by the JS hotkey handler right before showing the popover.
-/// Snapshots whether Keyring was frontmost (so we can decide on close
-/// whether to return focus to the previous app), and stamps popover-
-/// activity to suppress the Reopen event macOS fires as a side effect.
+/// Decides whether the user "was in main" — i.e., whether to return focus
+/// to main on popover close instead of pushing Keyring to the background.
+///
+/// The check is: Keyring is currently the frontmost app AND main window
+/// is visible. By the time JS runs after a hotkey fires, Tauri has often
+/// already activated us, so frontmost == Keyring isn't enough on its own.
+/// Combining with `main_currently_visible` (manually tracked via the
+/// CloseRequested handler) catches the case where Tauri auto-activated
+/// us but main isn't actually on screen — that's the user-was-elsewhere
+/// scenario.
 #[tauri::command]
 fn record_main_visibility(state: tauri::State<'_, SessionState>) {
     #[cfg(target_os = "macos")]
-    let frontmost = macos_focus::is_app_frontmost(BUNDLE_ID);
+    let frontmost_is_us = macos_focus::is_app_frontmost(BUNDLE_ID);
     #[cfg(not(target_os = "macos"))]
-    let frontmost = true;
+    let frontmost_is_us = true;
+
+    let main_visible = state.main_currently_visible.load(Ordering::SeqCst);
+    let user_was_in_main = frontmost_is_us && main_visible;
+
     state
         .keyring_was_frontmost_before_popover
-        .store(frontmost, Ordering::SeqCst);
+        .store(user_was_in_main, Ordering::SeqCst);
 
     if let Ok(mut guard) = state.popover_activity_at.lock() {
         *guard = Some(Instant::now());
@@ -157,15 +167,20 @@ fn handle_popover_close(app: tauri::AppHandle, state: tauri::State<'_, SessionSt
         let _ = popover.hide();
     }
 
-    let was_frontmost = state
+    let was_in_main = state
         .keyring_was_frontmost_before_popover
         .load(Ordering::SeqCst);
-    if was_frontmost {
-        return; // user was inside Keyring — let macOS pick the next window
+    if was_in_main {
+        return; // user was inside main — let macOS focus main as normal
     }
 
+    // User was in another app. Defensively re-hide main and send Keyring
+    // to background via Cmd+H — most reliable way to give focus back.
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
     #[cfg(target_os = "macos")]
-    macos_focus::deactivate_app();
+    macos_focus::hide_app_via_keystroke();
 }
 
 /// Bring the main window to the front. Used by tray clicks and global hotkey.

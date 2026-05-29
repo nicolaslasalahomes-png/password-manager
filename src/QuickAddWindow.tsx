@@ -15,7 +15,7 @@ import {
   AlertTriangle,
   Eye,
   EyeOff,
-  Lock,
+  KeyRound,
   RefreshCw,
   Save,
   ShieldCheck,
@@ -24,8 +24,10 @@ import {
 import { supabase } from './lib/supabase'
 import { createItem, listFolders, type ItemType, type VisibilityTier } from './lib/items'
 import { generatePassword } from './lib/generate'
-import { closeQuickAddWindow, getSessionDek } from './lib/desktop'
+import { unlockVault as cryptoUnlockVault, type KdfParams } from './lib/encryption'
+import { closeQuickAddWindow, getSessionDek, setSessionDek } from './lib/desktop'
 import { ToastProvider, useToast } from './state/ToastContext'
+import type { VaultMeta } from './state/VaultContext'
 
 const VALUE_FIELD_BY_TYPE: Record<ItemType | string, string> = {
   login: 'password',
@@ -44,8 +46,38 @@ const VALUE_LABEL_BY_TYPE: Record<ItemType | string, string> = {
 type Phase =
   | { kind: 'loading' }
   | { kind: 'signed-out' }
-  | { kind: 'locked' }
+  | { kind: 'locked'; user: User; meta: VaultMeta }
   | { kind: 'ready'; user: User; dek: Uint8Array }
+
+interface VaultUsersRow {
+  encrypted_dek: string
+  iv_dek: string
+  kdf_salt: string
+  kdf_params: KdfParams
+  verifier_ciphertext: string
+  verifier_iv: string
+}
+
+function rowToMeta(row: VaultUsersRow): VaultMeta {
+  return {
+    encryptedDek: row.encrypted_dek,
+    ivDek: row.iv_dek,
+    kdfSalt: row.kdf_salt,
+    kdfParams: row.kdf_params,
+    verifierCiphertext: row.verifier_ciphertext,
+    verifierIv: row.verifier_iv,
+  }
+}
+
+async function loadMeta(user: User): Promise<VaultMeta | null> {
+  const { data, error } = await supabase
+    .from('vault_users')
+    .select('encrypted_dek, iv_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv')
+    .eq('user_id', user.id)
+    .maybeSingle()
+  if (error || !data) return null
+  return rowToMeta(data as VaultUsersRow)
+}
 
 export default function QuickAddWindow() {
   return (
@@ -77,12 +109,19 @@ function QuickAddWindowInner() {
       setPhase({ kind: 'signed-out' })
       return
     }
+    const user = data.session.user
     const dek = await getSessionDek()
-    if (!dek) {
-      setPhase({ kind: 'locked' })
+    if (dek) {
+      setPhase({ kind: 'ready', user, dek })
       return
     }
-    setPhase({ kind: 'ready', user: data.session.user, dek })
+    // Locked — load vault meta so we can offer an in-popover unlock form.
+    const meta = await loadMeta(user)
+    if (!meta) {
+      setPhase({ kind: 'signed-out' })
+      return
+    }
+    setPhase({ kind: 'locked', user, meta })
   }
 
   return (
@@ -106,11 +145,9 @@ function QuickAddWindowInner() {
           />
         )}
         {phase.kind === 'locked' && (
-          <Message
-            tone="warn"
-            title="Vault is locked"
-            body="Open the main Keyring window and enter your master password. The hotkey will work once the vault is unlocked."
-            icon={<Lock size={16} />}
+          <UnlockForm
+            meta={phase.meta}
+            onUnlocked={(dek) => setPhase({ kind: 'ready', user: phase.user, dek })}
           />
         )}
         {phase.kind === 'ready' && <QuickAddForm user={phase.user} dek={phase.dek} />}
@@ -171,6 +208,65 @@ function Message({
         <p className="mt-1 text-xs opacity-80">{body}</p>
       </div>
     </div>
+  )
+}
+
+function UnlockForm({
+  meta,
+  onUnlocked,
+}: {
+  meta: VaultMeta
+  onUnlocked: (dek: Uint8Array) => void
+}) {
+  const [pw, setPw] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function onSubmit(e: FormEvent) {
+    e.preventDefault()
+    setSubmitting(true)
+    setError(null)
+    try {
+      const { dek } = await cryptoUnlockVault({ masterPassword: pw, ...meta })
+      // Push to Rust session state so future popovers + the main window pick it up.
+      await setSessionDek(dek)
+      // Tell the main window's VaultContext to sync its state.
+      try {
+        const { emit } = await import('@tauri-apps/api/event')
+        await emit('vault://unlocked-from-popover')
+      } catch {
+        /* ignore — non-fatal */
+      }
+      onUnlocked(dek)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unlock failed')
+      setPw('')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <form onSubmit={onSubmit} className="space-y-3">
+      <div className="flex items-center gap-2 rounded-lg border border-accent-500/30 bg-accent-950/30 p-3 text-xs text-accent-100">
+        <KeyRound size={14} className="flex-shrink-0" />
+        <span>Vault is locked. Enter your master password to unlock.</span>
+      </div>
+      <input
+        type="password"
+        className="input"
+        value={pw}
+        onChange={(e) => setPw(e.target.value)}
+        placeholder="Master password"
+        autoFocus
+        required
+      />
+      {error && <p className="text-xs text-red-300">{error}</p>}
+      <button type="submit" className="btn-primary w-full !py-1.5" disabled={submitting || !pw}>
+        <KeyRound size={14} />
+        {submitting ? 'Unlocking…' : 'Unlock'}
+      </button>
+    </form>
   )
 }
 

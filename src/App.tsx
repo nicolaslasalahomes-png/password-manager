@@ -11,7 +11,6 @@ import {
   onTrayEvent,
   openQuickAddWindow,
   registerHotkey,
-  showWindow,
   unregisterAllHotkeys,
 } from './lib/desktop'
 import Login from './pages/Login'
@@ -120,16 +119,11 @@ function SignedInShell() {
       if (cancelled) return
       if (combo) {
         await registerHotkey(combo, async () => {
-          // Read live status from ref (avoids stale-closure bug).
-          if (vaultStatusRef.current === 'unlocked') {
-            await openQuickAddWindow()
-          } else {
-            // Vault locked / no vault → bring main window forward so user
-            // can unlock first. After unlock, the consumer effect picks up
-            // the intent and opens quick-add window.
-            sessionStorage.setItem(HOTKEY_INTENT_KEY, 'quick-add-window')
-            await showWindow()
-          }
+          // Always open the popover. It handles its own state:
+          //   - Signed out → tells user to use main window
+          //   - Locked → shows in-popover unlock form
+          //   - Unlocked → shows the add-item form
+          await openQuickAddWindow()
         })
       } else if (!prompted && vaultStatus === 'unlocked') {
         // First unlocked session — show the wizard
@@ -145,7 +139,8 @@ function SignedInShell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // When vault transitions to unlocked, consume any pending hotkey intent.
+  // Vestigial: kept in case any code path still sets the intent. Most flows
+  // now handle locked-state directly in the popover.
   useEffect(() => {
     if (vaultStatus !== 'unlocked') return
     const intent = sessionStorage.getItem(HOTKEY_INTENT_KEY)

@@ -43,6 +43,7 @@ export default function Settings() {
   const [loaded, setLoaded] = useState(false)
   const [changeMasterPwOpen, setChangeMasterPwOpen] = useState(false)
   const [idleTimeoutMin, setIdleTimeoutMin] = useState<number>(30)
+  const [installedVersion, setInstalledVersion] = useState<string | null>(null)
   const [updateStatus, setUpdateStatus] = useState<
     | { kind: 'idle' }
     | { kind: 'checking' }
@@ -60,9 +61,11 @@ export default function Settings() {
     Promise.all([
       getStoreValue<string>(HOTKEY_STORE_KEY),
       getStoreValue<number>('idleLockTimeoutMin'),
-    ]).then(([h, t]) => {
+      import('@tauri-apps/api/app').then((m) => m.getVersion()).catch(() => null),
+    ]).then(([h, t, v]) => {
       setHotkey(h)
       if (typeof t === 'number') setIdleTimeoutMin(t)
+      setInstalledVersion(typeof v === 'string' ? v : null)
       setLoaded(true)
     })
   }, [isDesktop])
@@ -210,6 +213,11 @@ export default function Settings() {
               vertical
             >
               <UpdateControls status={updateStatus} setStatus={setUpdateStatus} />
+            </Row>
+            <Row label="Installed version">
+              <span className="font-mono text-xs text-ink-200">
+                {installedVersion ? `v${installedVersion}` : '—'}
+              </span>
             </Row>
           </Section>
         )}

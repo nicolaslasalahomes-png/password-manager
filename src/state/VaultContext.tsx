@@ -18,7 +18,7 @@ import {
   type KdfParams,
 } from '../lib/encryption'
 import { useAuth } from './AuthContext'
-import { clearSessionDek, setSessionDek } from '../lib/desktop'
+import { clearSessionDek, getSessionDek, isDesktop, setSessionDek } from '../lib/desktop'
 
 export type VaultStatus = 'loading' | 'no-vault' | 'locked' | 'unlocked'
 
@@ -231,6 +231,33 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     }
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
+  }, [])
+
+  // Listen for popover-unlocked events. The quick-add window unlocks the
+  // vault directly (calling setSessionDek on the Rust side); this listener
+  // syncs our context's view so the main window doesn't keep showing the
+  // unlock screen if the user opens it later.
+  useEffect(() => {
+    if (!isDesktop()) return
+    let unlisten: (() => void) | null = null
+    ;(async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen('vault://unlocked-from-popover', async () => {
+          const dek = await getSessionDek()
+          if (!dek) return
+          if (dekRef.current) zero(dekRef.current)
+          dekRef.current = dek
+          setStatus('unlocked')
+          forceTick((t) => t + 1)
+        })
+      } catch (err) {
+        console.warn('[vault] failed to listen for popover-unlock events', err)
+      }
+    })()
+    return () => {
+      unlisten?.()
+    }
   }, [])
 
   const api = useMemo<VaultApi>(
