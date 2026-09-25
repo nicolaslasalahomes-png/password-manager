@@ -7,9 +7,15 @@ interface Props {
   message?: string
   onVerified: () => void
   onCancel: () => void
+  /**
+   * Override the default verify-only behaviour. Receives the entered password;
+   * throw to signal failure (the thrown message is shown). Used for elevation,
+   * which must unwrap the highDek — not just check the verifier.
+   */
+  action?: (masterPassword: string) => Promise<void>
 }
 
-export default function MasterPasswordPrompt({ title, message, onVerified, onCancel }: Props) {
+export default function MasterPasswordPrompt({ title, message, onVerified, onCancel, action }: Props) {
   const { verifyMasterPassword } = useVault()
   const [pw, setPw] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -20,13 +26,21 @@ export default function MasterPasswordPrompt({ title, message, onVerified, onCan
     setSubmitting(true)
     setError(null)
     try {
-      const ok = await verifyMasterPassword(pw)
-      if (ok) {
+      if (action) {
+        await action(pw)
         onVerified()
       } else {
-        setError('Incorrect master password')
-        setPw('')
+        const ok = await verifyMasterPassword(pw)
+        if (ok) {
+          onVerified()
+        } else {
+          setError('Incorrect master password')
+          setPw('')
+        }
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Incorrect master password')
+      setPw('')
     } finally {
       setSubmitting(false)
     }

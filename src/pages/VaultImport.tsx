@@ -40,7 +40,7 @@ const SAMPLE = `{
 
 export default function VaultImport() {
   const { user } = useAuth()
-  const { dek } = useVault()
+  const { dek, highDek } = useVault()
   const toast = useToast()
   const navigate = useNavigate()
   const fileInput = useRef<HTMLInputElement>(null)
@@ -103,7 +103,7 @@ export default function VaultImport() {
             username_hint: it.username_hint ?? null,
             fields: it.fields,
           },
-          dek,
+          { dek, highDek },
         )
         done++
       } catch (err) {

@@ -3,13 +3,14 @@ import {
   AlertTriangle,
   Cpu,
   Download,
+  ExternalLink,
   Eye,
-  Fingerprint,
   Keyboard as KeyboardIcon,
   KeyRound,
   Loader2,
   LogOut,
   ShieldCheck,
+  Sparkles,
 } from 'lucide-react'
 import Layout from '../components/Layout'
 import ChangeMasterPasswordModal from '../components/ChangeMasterPasswordModal'
@@ -17,6 +18,14 @@ import HotkeyRecorder, { comboToGlyph } from '../components/HotkeyRecorder'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
+import {
+  generateBriefing,
+  getBriefingEnabled,
+  markBriefingsSeen,
+  setBriefingEnabled,
+} from '../lib/briefing'
+import { type UsageStore, getUsage, resetUsage } from '../lib/ai/usage'
+import { openExternalUrl } from '../lib/desktop'
 import {
   checkForUpdate,
   downloadAndInstallUpdate,
@@ -124,6 +133,12 @@ export default function Settings() {
           <Row label="Signed in as">
             <span className="font-mono text-sm text-ink-100">{user?.email}</span>
           </Row>
+          <Row
+            label="Email 2FA"
+            hint="Email a 6-digit code on every sign-in. Doesn't change the master password — that still gates vault decryption."
+          >
+            <EmailMfaToggle />
+          </Row>
           <Row label="Sign out">
             <button onClick={() => signOut()} className="btn-secondary !py-1.5 !text-xs">
               <LogOut size={12} /> Sign out
@@ -178,6 +193,43 @@ export default function Settings() {
         </Section>
 
         {isDesktop && (
+          <Section title="Tasks & notifications" icon={<Cpu size={14} />}>
+            <Row
+              label="Work hours"
+              hint="Notifications only fire during these hours, on the selected days."
+              vertical
+            >
+              <WorkHoursControl />
+            </Row>
+            <Row
+              label="Notification permission"
+              hint="macOS needs your one-time approval. Required for any reminders to appear."
+            >
+              <NotificationPermissionControl />
+            </Row>
+            <Row
+              label="Daily briefing"
+              hint="Once per day on first open, Claude writes a short 'what to focus on' from your open tasks + important emails since your last brief. Needs your Anthropic key (Inbox Settings). Task titles & email subjects are sent to Claude — never secret values."
+              vertical
+            >
+              <BriefingControl />
+            </Row>
+          </Section>
+        )}
+
+        {isDesktop && (
+          <Section title="AI usage" icon={<Sparkles size={14} />}>
+            <Row
+              label="Claude spend (estimated)"
+              hint="Counts only Keyring's own calls (inbox classifier + daily brief). Cost is an estimate from current Haiku pricing — the authoritative bill is in your Anthropic console."
+              vertical
+            >
+              <UsageControl />
+            </Row>
+          </Section>
+        )}
+
+        {isDesktop && (
           <Section title="Desktop" icon={<Cpu size={14} />}>
             <Row
               label="Quick-add hotkey"
@@ -193,14 +245,6 @@ export default function Settings() {
               ) : (
                 <p className="text-xs text-ink-400">Loading…</p>
               )}
-            </Row>
-            <Row
-              label="Touch ID unlock"
-              hint="Unlock vault with fingerprint instead of master password."
-            >
-              <button disabled className="btn-secondary !py-1.5 !text-xs opacity-50">
-                <Fingerprint size={12} /> Coming soon
-              </button>
             </Row>
             <Row label="Launch on login" hint="Start Keyring automatically when you sign in.">
               <button disabled className="btn-secondary !py-1.5 !text-xs opacity-50">
@@ -227,10 +271,10 @@ export default function Settings() {
             <div className="flex items-start gap-3 rounded-lg border border-accent-500/30 bg-accent-950/30 p-3 text-sm text-accent-100">
               <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
               <div>
-                <p className="font-medium">Get the desktop app for hotkey + Touch ID</p>
+                <p className="font-medium">Get the desktop app for the global hotkey</p>
                 <p className="mt-1 text-xs text-accent-200/80">
-                  Install Keyring as a Mac app to get a global hotkey for instant access and
-                  fingerprint unlock. Download coming soon.
+                  Install Keyring as a Mac app to get a global hotkey for instant access from any app.
+                  Download coming soon.
                 </p>
               </div>
             </div>
@@ -242,6 +286,353 @@ export default function Settings() {
         <ChangeMasterPasswordModal onClose={() => setChangeMasterPwOpen(false)} />
       )}
     </Layout>
+  )
+}
+
+/**
+ * Email 2FA enrollment toggle.
+ *
+ * When turning ON we don't trust the user to receive emails until they prove
+ * it: we send a test code, they enter it, only THEN do we flip the
+ * email_2fa_enabled flag in user_metadata. That way nobody enables 2FA and
+ * locks themselves out because their typo'd email address can't receive code.
+ *
+ * When turning OFF, no challenge — they're already signed in past the gate.
+ */
+function EmailMfaToggle() {
+  const { emailMfaEnabled, setEmailMfaEnabled, sendMfaCode, verifyMfaCode } = useAuth()
+  const toast = useToast()
+  const [stage, setStage] = useState<'idle' | 'sending' | 'awaiting' | 'verifying'>('idle')
+  const [code, setCode] = useState('')
+
+  async function onTurnOn() {
+    setStage('sending')
+    try {
+      await sendMfaCode()
+      setStage('awaiting')
+      toast.info('Check your email for the test code')
+    } catch (err) {
+      setStage('idle')
+      toast.error(err instanceof Error ? err.message : 'Could not send test code')
+    }
+  }
+
+  async function onConfirm() {
+    if (!/^\d{6}$/.test(code)) {
+      toast.error('Code must be 6 digits')
+      return
+    }
+    setStage('verifying')
+    try {
+      await verifyMfaCode(code)
+      await setEmailMfaEnabled(true)
+      toast.success('Email 2FA enabled')
+      setStage('idle')
+      setCode('')
+    } catch (err) {
+      setStage('awaiting')
+      toast.error(err instanceof Error ? err.message : 'Verification failed')
+    }
+  }
+
+  async function onTurnOff() {
+    try {
+      await setEmailMfaEnabled(false)
+      toast.success('Email 2FA disabled')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not disable')
+    }
+  }
+
+  if (emailMfaEnabled) {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-300">
+          <ShieldCheck size={12} /> Enabled
+        </span>
+        <button onClick={onTurnOff} className="btn-secondary !py-1.5 !text-xs">
+          Disable
+        </button>
+      </div>
+    )
+  }
+
+  if (stage === 'awaiting' || stage === 'verifying') {
+    return (
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          inputMode="numeric"
+          maxLength={6}
+          value={code}
+          onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+          placeholder="6-digit code"
+          className="input-mono !w-32 text-center !text-sm tracking-[6px]"
+          autoFocus
+        />
+        <button
+          onClick={onConfirm}
+          disabled={stage === 'verifying' || code.length !== 6}
+          className="btn-primary !py-1.5 !text-xs"
+        >
+          {stage === 'verifying' ? 'Verifying…' : 'Confirm'}
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <button
+      onClick={onTurnOn}
+      disabled={stage === 'sending'}
+      className="btn-secondary !py-1.5 !text-xs"
+    >
+      <ShieldCheck size={12} /> {stage === 'sending' ? 'Sending…' : 'Enable Email 2FA'}
+    </button>
+  )
+}
+
+function WorkHoursControl() {
+  const toast = useToast()
+  const [start, setStart] = useState('09:00')
+  const [end, setEnd] = useState('18:00')
+  const [days, setDays] = useState<number[]>([1, 2, 3, 4, 5])
+  const [loaded, setLoaded] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    void (async () => {
+      const { getWorkHours } = await import('../lib/tasks')
+      const wh = await getWorkHours()
+      setStart(wh.start)
+      setEnd(wh.end)
+      setDays(wh.days)
+      setLoaded(true)
+    })()
+  }, [])
+
+  function toggleDay(d: number) {
+    setDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort()))
+  }
+
+  async function save() {
+    setSaving(true)
+    try {
+      const { setWorkHours } = await import('../lib/tasks')
+      await setWorkHours({ start, end, days })
+      toast.success('Work hours saved')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!loaded) return <span className="text-xs text-ink-400">Loading…</span>
+  const DAY_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <input
+          type="time"
+          value={start}
+          onChange={(e) => setStart(e.target.value)}
+          className="input !py-1.5 text-xs"
+        />
+        <span className="text-xs text-ink-400">to</span>
+        <input
+          type="time"
+          value={end}
+          onChange={(e) => setEnd(e.target.value)}
+          className="input !py-1.5 text-xs"
+        />
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {DAY_LABELS.map((label, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => toggleDay(i)}
+            className={`h-7 w-7 rounded text-[11px] font-medium transition ${
+              days.includes(i)
+                ? 'bg-accent-600/20 text-accent-200 ring-1 ring-accent-600/40'
+                : 'bg-ink-800 text-ink-400 hover:text-ink-100'
+            }`}
+            title={['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][i]}
+          >
+            {label}
+          </button>
+        ))}
+        <button onClick={save} disabled={saving} className="btn-primary ml-auto !px-3 !py-1.5 !text-xs">
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function UsageControl() {
+  const toast = useToast()
+  const [usage, setUsage] = useState<UsageStore | null>(null)
+
+  const refresh = () => getUsage().then(setUsage).catch(() => {})
+  useEffect(() => {
+    void refresh()
+  }, [])
+
+  const fmt = (n: number) => `$${n.toFixed(n < 1 ? 4 : 2)}`
+  const tokens = (n: number) =>
+    n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+
+  return (
+    <div className="w-full space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <div className="rounded-lg border border-ink-800 bg-ink-900/40 p-3">
+          <div className="text-[11px] uppercase tracking-wider text-ink-500">This month</div>
+          <div className="mt-1 text-lg font-semibold text-ink-50">
+            {usage ? fmt(usage.monthCostUsd) : '—'}
+          </div>
+          <div className="text-[11px] text-ink-400">{usage?.monthCalls ?? 0} calls</div>
+        </div>
+        <div className="rounded-lg border border-ink-800 bg-ink-900/40 p-3">
+          <div className="text-[11px] uppercase tracking-wider text-ink-500">All time</div>
+          <div className="mt-1 text-lg font-semibold text-ink-50">
+            {usage ? fmt(usage.totalCostUsd) : '—'}
+          </div>
+          <div className="text-[11px] text-ink-400">
+            {usage ? `${tokens(usage.totalInput)} in · ${tokens(usage.totalOutput)} out` : ''}
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => void openExternalUrl('https://console.anthropic.com/settings/usage')}
+          className="btn-secondary !py-1.5 !text-xs"
+        >
+          <ExternalLink size={12} /> Open Anthropic console
+        </button>
+        <button
+          onClick={async () => {
+            if (!confirm('Reset the local usage counter to zero?')) return
+            await resetUsage()
+            await refresh()
+            toast.success('Usage reset')
+          }}
+          className="btn-ghost !py-1.5 !text-xs !text-ink-400"
+        >
+          Reset counter
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function BriefingControl() {
+  const toast = useToast()
+  const { dek } = useVault()
+  const { user } = useAuth()
+  const navigate = useNavigate()
+  const [enabled, setEnabled] = useState(false)
+  const [generating, setGenerating] = useState(false)
+
+  useEffect(() => {
+    getBriefingEnabled().then(setEnabled).catch(() => {})
+  }, [])
+
+  async function onToggle(v: boolean) {
+    try {
+      await setBriefingEnabled(v)
+      setEnabled(v)
+      toast.success(v ? 'Daily briefing on' : 'Daily briefing off')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not toggle')
+    }
+  }
+
+  async function onGenerateNow() {
+    if (!user || !dek) {
+      toast.error('Unlock the vault first')
+      return
+    }
+    setGenerating(true)
+    try {
+      await generateBriefing(user.id, dek)
+      await markBriefingsSeen()
+      toast.success('Brief generated')
+      navigate('/vault/briefing')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not generate brief')
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => void onToggle(e.target.checked)}
+          className="h-4 w-4 accent-accent-500"
+        />
+        <span className="text-xs text-ink-300">
+          {enabled ? 'On — brief on first open each day' : 'Off'}
+        </span>
+      </label>
+      <button
+        onClick={onGenerateNow}
+        disabled={generating}
+        className="btn-secondary !py-1.5 !text-xs"
+      >
+        <Sparkles size={12} /> {generating ? 'Writing…' : 'Generate one now'}
+      </button>
+    </div>
+  )
+}
+
+function NotificationPermissionControl() {
+  const toast = useToast()
+  const [granted, setGranted] = useState<boolean | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const { isPermissionGranted } = await import('@tauri-apps/plugin-notification')
+        setGranted(await isPermissionGranted())
+      } catch {
+        setGranted(false)
+      }
+    })()
+  }, [])
+
+  async function onRequest() {
+    setBusy(true)
+    try {
+      const { requestNotificationPermissionOnce } = await import('../lib/notifications')
+      const ok = await requestNotificationPermissionOnce()
+      setGranted(ok)
+      toast[ok ? 'success' : 'error'](
+        ok ? 'Notifications enabled' : 'Permission denied — enable in System Settings → Notifications',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (granted === null) return <span className="text-xs text-ink-400">Checking…</span>
+  if (granted) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-300">
+        <ShieldCheck size={12} /> Granted
+      </span>
+    )
+  }
+  return (
+    <button onClick={onRequest} disabled={busy} className="btn-secondary !py-1.5 !text-xs">
+      {busy ? 'Requesting…' : 'Request permission'}
+    </button>
   )
 }
 

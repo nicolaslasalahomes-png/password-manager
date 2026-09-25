@@ -22,6 +22,8 @@ type Phase =
 interface VaultUsersRow {
   encrypted_dek: string
   iv_dek: string
+  encrypted_high_dek: string | null
+  iv_high_dek: string | null
   kdf_salt: string
   kdf_params: VaultMeta['kdfParams']
   verifier_ciphertext: string
@@ -32,6 +34,8 @@ function rowToMeta(row: VaultUsersRow): VaultMeta {
   return {
     encryptedDek: row.encrypted_dek,
     ivDek: row.iv_dek,
+    encryptedHighDek: row.encrypted_high_dek,
+    ivHighDek: row.iv_high_dek,
     kdfSalt: row.kdf_salt,
     kdfParams: row.kdf_params,
     verifierCiphertext: row.verifier_ciphertext,
@@ -42,7 +46,9 @@ function rowToMeta(row: VaultUsersRow): VaultMeta {
 async function loadMeta(user: User): Promise<VaultMeta | null> {
   const { data, error } = await supabase
     .from('vault_users')
-    .select('encrypted_dek, iv_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv')
+    .select(
+      'encrypted_dek, iv_dek, encrypted_high_dek, iv_high_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv',
+    )
     .eq('user_id', user.id)
     .maybeSingle()
   if (error || !data) return null
@@ -265,6 +271,15 @@ function Unlocked({
   }, [items, q])
 
   async function copyPrimaryField(item: VaultItemRow) {
+    // High-tier items are encrypted with the highDek, which this extension
+    // never holds (only the desktop/web app derives it from the master
+    // password). Don't attempt to decrypt — point the user to the full app.
+    if (item.visibility_tier === 'high') {
+      const original = document.title
+      document.title = '🔒 Master password required'
+      setTimeout(() => (document.title = original), 1600)
+      return
+    }
     try {
       const fields = await decryptJson<Record<string, string>>(
         item.encrypted_data,

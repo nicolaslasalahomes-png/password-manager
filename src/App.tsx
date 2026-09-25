@@ -9,12 +9,22 @@ import {
   getStoreValue,
   isDesktop,
   onTrayEvent,
+  open2faPopover,
   openQuickAddWindow,
   registerHotkey,
   unregisterAllHotkeys,
 } from './lib/desktop'
+import { startGmailPoller } from './lib/google/poller'
+import {
+  generateBriefing,
+  getBriefingEnabled,
+  getLastBriefingMeta,
+  isNewDaySince,
+} from './lib/briefing'
+import { startNotificationScheduler } from './lib/notifications'
 import Login from './pages/Login'
 import Signup from './pages/Signup'
+import MfaChallenge from './pages/MfaChallenge'
 import VaultSetup from './pages/VaultSetup'
 import VaultUnlock from './pages/VaultUnlock'
 import VaultList from './pages/VaultList'
@@ -22,6 +32,12 @@ import ItemNew from './pages/ItemNew'
 import ItemView from './pages/ItemView'
 import VaultImport from './pages/VaultImport'
 import QuickAdd from './pages/QuickAdd'
+import Inbox from './pages/Inbox'
+import InboxSettings from './pages/InboxSettings'
+import Todo from './pages/Todo'
+import Calendar from './pages/Calendar'
+import Notifications from './pages/Notifications'
+import BriefingPage from './pages/Briefing'
 import Settings from './pages/Settings'
 import HotkeyFirstRunModal from './components/HotkeyFirstRunModal'
 import UpdateBanner from './components/UpdateBanner'
@@ -32,7 +48,7 @@ const IDLE_TIMEOUT_STORE_KEY = 'idleLockTimeoutMin'
 const DEFAULT_IDLE_TIMEOUT_MIN = 30 // desktop default; web fallback inside the hook
 
 export default function App() {
-  const { user, loading: authLoading } = useAuth()
+  const { user, loading: authLoading, mfaPending } = useAuth()
 
   if (authLoading) return <FullPageLoader label="Loading session…" />
 
@@ -47,13 +63,24 @@ export default function App() {
     )
   }
 
+  // Signed in but owes an email-OTP — show only the MFA challenge until verified.
+  // The vault is unreachable until mfaPending flips to false.
+  if (mfaPending) {
+    return (
+      <Routes>
+        <Route path="*" element={<MfaChallenge />} />
+      </Routes>
+    )
+  }
+
   // Signed-in shell — owns hotkey, tray, auto-lock, auto-update.
   // All of these need to survive vault lock/unlock cycles.
   return <SignedInShell />
 }
 
 function SignedInShell() {
-  const { status: vaultStatus, lockVault } = useVault()
+  const { status: vaultStatus, lockVault, dek } = useVault()
+  const { user } = useAuth()
   const toast = useToast()
   const navigate = useNavigate()
 
@@ -170,6 +197,86 @@ function SignedInShell() {
     }
   }, [])
 
+  // Gmail poller — fires the 2FA popover whenever a verification email arrives.
+  // Only active on desktop + unlocked vault. Stops on lock or sign-out via the
+  // effect cleanup.
+  useEffect(() => {
+    if (!isDesktop() || vaultStatus !== 'unlocked' || !dek || !user) return
+    const handle = startGmailPoller({
+      dek,
+      userId: user.id,
+      callbacks: {
+        on2faDetected: (account, parsed, match) => {
+          void open2faPopover({
+            gmailMessageId: parsed.id,
+            accountId: account.id,
+            accountEmail: account.email,
+            fromName: parsed.fromName,
+            subject: parsed.subject,
+            code: match.code,
+            magicLink: match.link,
+            receivedAt: parsed.receivedAt,
+          })
+        },
+        onError: (account, err) => {
+          // Surface only the account-needs-reauth case to the user; other
+          // errors stay in the console to avoid notification spam during
+          // transient network blips.
+          console.warn('[gmail-poller]', account?.email ?? '(global)', err)
+        },
+      },
+    })
+    return () => handle.stop()
+  }, [vaultStatus, dek, user])
+
+  // Task notification scheduler — fires native macOS notifications based on
+  // each task's priority + the user's configured work hours. Only active on
+  // desktop + unlocked. Stops on lock or sign-out via effect cleanup.
+  useEffect(() => {
+    if (!isDesktop() || vaultStatus !== 'unlocked') return
+    const handle = startNotificationScheduler()
+    return () => handle.stop()
+  }, [vaultStatus])
+
+  // Daily briefing — generated on the first app-open of a calendar day (and
+  // again only on a NEW day). Covers everything since the last brief, so missed
+  // days roll forward. "Last briefed" lives in Supabase (per account), so it
+  // survives reinstalls. Triggered on unlock + whenever the window regains
+  // focus (catches the case where the vault stayed unlocked across midnight).
+  const briefInFlight = useRef(false)
+  const maybeBrief = useCallback(async () => {
+    if (!isDesktop() || vaultStatus !== 'unlocked' || !dek || !user) return
+    if (briefInFlight.current) return
+    try {
+      if (!(await getBriefingEnabled())) return
+      const last = await getLastBriefingMeta()
+      if (!isNewDaySince(last?.generated_at ?? null)) return
+      briefInFlight.current = true
+      await generateBriefing(user.id, dek)
+      // No popup — the brief lands silently in the Briefing tab; the sidebar
+      // shows an unseen dot until the user opens it.
+      window.dispatchEvent(new Event('keyring:briefing-changed'))
+    } catch (err) {
+      console.warn('[briefing] generation skipped/failed:', err)
+    } finally {
+      briefInFlight.current = false
+    }
+  }, [vaultStatus, dek, user])
+
+  useEffect(() => {
+    void maybeBrief()
+  }, [maybeBrief])
+
+  useEffect(() => {
+    const onFocus = () => void maybeBrief()
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
+  }, [maybeBrief])
+
   // Tray menu items → app actions
   useEffect(() => {
     if (!isDesktop()) return
@@ -213,6 +320,13 @@ function SignedInShell() {
         <Route path="/vault/new" element={<ItemNew />} />
         <Route path="/vault/import" element={<VaultImport />} />
         <Route path="/vault/quick-add" element={<QuickAdd />} />
+        <Route path="/vault/inbox" element={<Inbox />} />
+        <Route path="/vault/inbox/all" element={<Inbox />} />
+        <Route path="/vault/inbox/settings" element={<InboxSettings />} />
+        <Route path="/vault/todo" element={<Todo />} />
+        <Route path="/vault/calendar" element={<Calendar />} />
+        <Route path="/vault/notifications" element={<Notifications />} />
+        <Route path="/vault/briefing" element={<BriefingPage />} />
         <Route path="/vault/settings" element={<Settings />} />
         <Route path="/vault/:id" element={<ItemView />} />
         <Route path="*" element={<Navigate to="/vault" replace />} />

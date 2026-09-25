@@ -11,6 +11,8 @@ import {
 import { supabase } from '../lib/supabase'
 import {
   changeMasterPassword as cryptoChangeMasterPassword,
+  createHighDek as cryptoCreateHighDek,
+  elevateHighDek as cryptoElevateHighDek,
   setupVault as cryptoSetupVault,
   unlockVault as cryptoUnlockVault,
   verifyMasterPassword as cryptoVerifyMasterPassword,
@@ -18,13 +20,26 @@ import {
   type KdfParams,
 } from '../lib/encryption'
 import { useAuth } from './AuthContext'
-import { clearSessionDek, getSessionDek, isDesktop, setSessionDek } from '../lib/desktop'
+import {
+  biometricAvailable as desktopBiometricAvailable,
+  biometricDelete,
+  biometricExists,
+  biometricRetrieve,
+  biometricStore,
+  clearSessionDek,
+  getSessionDek,
+  isDesktop,
+  setSessionDek,
+} from '../lib/desktop'
 
 export type VaultStatus = 'loading' | 'no-vault' | 'locked' | 'unlocked'
 
 export interface VaultMeta {
   encryptedDek: string
   ivDek: string
+  /** Null on legacy vaults created before the two-key model (until migrated). */
+  encryptedHighDek: string | null
+  ivHighDek: string | null
   kdfSalt: string
   kdfParams: KdfParams
   verifierCiphertext: string
@@ -34,14 +49,28 @@ export interface VaultMeta {
 interface VaultApi {
   status: VaultStatus
   meta: VaultMeta | null
-  /** The raw DEK — only available while unlocked. Never persist. */
+  /** The raw DEK (low/medium items) — only while unlocked. Never persist. */
   dek: Uint8Array | null
+  /** The raw highDek (high-tier items) — null until full unlock / elevation. */
+  highDek: Uint8Array | null
+  /** True when highDek is in memory: high-tier items are accessible. */
+  highUnlocked: boolean
   setupVault: (masterPassword: string) => Promise<void>
+  /** Full unlock with the master password: both keys in memory. */
   unlockVault: (masterPassword: string) => Promise<void>
+  /** Standard unlock via Touch ID: only the DEK; high-tier stays locked. */
+  unlockWithBiometric: () => Promise<void>
+  /** From a Touch ID session, unwrap the highDek with the master password. */
+  elevate: (masterPassword: string) => Promise<void>
   lockVault: () => void
   verifyMasterPassword: (masterPassword: string) => Promise<boolean>
   changeMasterPassword: (currentMasterPassword: string, newMasterPassword: string) => Promise<void>
   reload: () => Promise<void>
+  // Biometric (Touch ID) management — all no-op/false off desktop.
+  biometricAvailable: () => Promise<boolean>
+  isBiometricEnrolled: () => Promise<boolean>
+  enableBiometric: () => Promise<void>
+  disableBiometric: () => Promise<void>
 }
 
 const VaultContext = createContext<VaultApi | null>(null)
@@ -49,16 +78,23 @@ const VaultContext = createContext<VaultApi | null>(null)
 interface VaultUsersRow {
   encrypted_dek: string
   iv_dek: string
+  encrypted_high_dek: string | null
+  iv_high_dek: string | null
   kdf_salt: string
   kdf_params: KdfParams
   verifier_ciphertext: string
   verifier_iv: string
 }
 
+const VAULT_USERS_COLUMNS =
+  'encrypted_dek, iv_dek, encrypted_high_dek, iv_high_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv'
+
 function rowToMeta(row: VaultUsersRow): VaultMeta {
   return {
     encryptedDek: row.encrypted_dek,
     ivDek: row.iv_dek,
+    encryptedHighDek: row.encrypted_high_dek,
+    ivHighDek: row.iv_high_dek,
     kdfSalt: row.kdf_salt,
     kdfParams: row.kdf_params,
     verifierCiphertext: row.verifier_ciphertext,
@@ -71,7 +107,10 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const [meta, setMeta] = useState<VaultMeta | null>(null)
   const [status, setStatus] = useState<VaultStatus>('loading')
   const dekRef = useRef<Uint8Array | null>(null)
-  const [, forceTick] = useState(0)
+  const highDekRef = useRef<Uint8Array | null>(null)
+  // Bumped on every key transition (unlock / biometric / elevate / lock) so the
+  // memoized api re-reads dekRef/highDekRef even when status & meta are unchanged.
+  const [tick, forceTick] = useState(0)
 
   const loadMeta = useCallback(async () => {
     if (!user) {
@@ -81,7 +120,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     }
     const { data, error } = await supabase
       .from('vault_users')
-      .select('encrypted_dek, iv_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv')
+      .select(VAULT_USERS_COLUMNS)
       .eq('user_id', user.id)
       .maybeSingle()
 
@@ -111,6 +150,10 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         zero(dekRef.current)
         dekRef.current = null
       }
+      if (highDekRef.current) {
+        zero(highDekRef.current)
+        highDekRef.current = null
+      }
       setMeta(null)
       setStatus('loading')
       return
@@ -126,6 +169,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         user_id: user.id,
         encrypted_dek: material.encryptedDek,
         iv_dek: material.ivDek,
+        encrypted_high_dek: material.encryptedHighDek,
+        iv_high_dek: material.ivHighDek,
         kdf_salt: material.kdfSalt,
         kdf_params: material.kdfParams,
         verifier_ciphertext: material.verifierCiphertext,
@@ -133,14 +178,18 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       })
       if (error) {
         zero(material.dek)
+        zero(material.highDek)
         throw error
       }
       dekRef.current = material.dek
-      // Mirror to Rust state so the quick-add window can use it.
+      highDekRef.current = material.highDek
+      // Mirror the DEK (only) to Rust state so the quick-add window can use it.
       void setSessionDek(material.dek)
       setMeta({
         encryptedDek: material.encryptedDek,
         ivDek: material.ivDek,
+        encryptedHighDek: material.encryptedHighDek,
+        ivHighDek: material.ivHighDek,
         kdfSalt: material.kdfSalt,
         kdfParams: material.kdfParams,
         verifierCiphertext: material.verifierCiphertext,
@@ -154,21 +203,119 @@ export function VaultProvider({ children }: { children: ReactNode }) {
 
   const unlockVault = useCallback(
     async (masterPassword: string) => {
-      if (!meta) throw new Error('No vault to unlock')
-      const { dek } = await cryptoUnlockVault({ masterPassword, ...meta })
+      if (!user || !meta) throw new Error('No vault to unlock')
+      const { dek, highDek } = await cryptoUnlockVault({ masterPassword, ...meta })
+
+      // Legacy single-key vault: mint a highDek now and persist it (one-time
+      // migration). Pre-existing high-tier rows are re-encrypted lazily on
+      // first access (see decryptItem). Idempotent and crash-safe.
+      let resolvedHighDek = highDek
+      if (!resolvedHighDek) {
+        const minted = await cryptoCreateHighDek({
+          masterPassword,
+          kdfSalt: meta.kdfSalt,
+          kdfParams: meta.kdfParams,
+        })
+        const { error } = await supabase
+          .from('vault_users')
+          .update({ encrypted_high_dek: minted.encryptedHighDek, iv_high_dek: minted.ivHighDek })
+          .eq('user_id', user.id)
+        if (error) {
+          zero(dek)
+          zero(minted.highDek)
+          throw error
+        }
+        resolvedHighDek = minted.highDek
+        setMeta((prev) =>
+          prev
+            ? { ...prev, encryptedHighDek: minted.encryptedHighDek, ivHighDek: minted.ivHighDek }
+            : prev,
+        )
+      }
+
       if (dekRef.current) zero(dekRef.current)
+      if (highDekRef.current) zero(highDekRef.current)
       dekRef.current = dek
+      highDekRef.current = resolvedHighDek
       void setSessionDek(dek)
       setStatus('unlocked')
       forceTick((t) => t + 1)
     },
-    [meta],
+    [user, meta],
+  )
+
+  // Standard unlock via Touch ID. Retrieves only the DEK from the Secure
+  // Enclave Keychain (triggers the fingerprint prompt). highDek stays null —
+  // high-tier items remain locked until the user elevates with the master pw.
+  const unlockWithBiometric = useCallback(async () => {
+    if (!user) throw new Error('Must be signed in')
+    const dek = await biometricRetrieve(user.id)
+    if (dekRef.current) zero(dekRef.current)
+    if (highDekRef.current) {
+      zero(highDekRef.current)
+      highDekRef.current = null
+    }
+    dekRef.current = dek
+    void setSessionDek(dek)
+    setStatus('unlocked')
+    forceTick((t) => t + 1)
+  }, [user])
+
+  // Elevate a Touch ID (standard) session to full by unwrapping the highDek
+  // with the master password. On a not-yet-migrated vault, mints + persists it.
+  const elevate = useCallback(
+    async (masterPassword: string) => {
+      if (!user || !meta) throw new Error('Vault not loaded')
+      let highDek: Uint8Array
+      if (meta.encryptedHighDek && meta.ivHighDek) {
+        highDek = await cryptoElevateHighDek({
+          masterPassword,
+          kdfSalt: meta.kdfSalt,
+          kdfParams: meta.kdfParams,
+          verifierCiphertext: meta.verifierCiphertext,
+          verifierIv: meta.verifierIv,
+          encryptedHighDek: meta.encryptedHighDek,
+          ivHighDek: meta.ivHighDek,
+        })
+      } else {
+        // Legacy vault elevated before its first full unlock: verify, then mint.
+        const ok = await cryptoVerifyMasterPassword({ masterPassword, ...meta })
+        if (!ok) throw new Error('Incorrect master password')
+        const minted = await cryptoCreateHighDek({
+          masterPassword,
+          kdfSalt: meta.kdfSalt,
+          kdfParams: meta.kdfParams,
+        })
+        const { error } = await supabase
+          .from('vault_users')
+          .update({ encrypted_high_dek: minted.encryptedHighDek, iv_high_dek: minted.ivHighDek })
+          .eq('user_id', user.id)
+        if (error) {
+          zero(minted.highDek)
+          throw error
+        }
+        highDek = minted.highDek
+        setMeta((prev) =>
+          prev
+            ? { ...prev, encryptedHighDek: minted.encryptedHighDek, ivHighDek: minted.ivHighDek }
+            : prev,
+        )
+      }
+      if (highDekRef.current) zero(highDekRef.current)
+      highDekRef.current = highDek
+      forceTick((t) => t + 1)
+    },
+    [user, meta],
   )
 
   const lockVault = useCallback(() => {
     if (dekRef.current) {
       zero(dekRef.current)
       dekRef.current = null
+    }
+    if (highDekRef.current) {
+      zero(highDekRef.current)
+      highDekRef.current = null
     }
     void clearSessionDek()
     setStatus((prev) => (prev === 'unlocked' ? 'locked' : prev))
@@ -186,19 +333,21 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const changeMasterPassword = useCallback(
     async (currentMasterPassword: string, newMasterPassword: string) => {
       if (!user || !meta) throw new Error('Vault not loaded')
-      // Derives new salt + KEK, re-wraps DEK. Throws if current pw is wrong.
+      // Derives new salt + KEK, re-wraps both keys. Throws if current pw is wrong.
       const material = await cryptoChangeMasterPassword({
         currentMasterPassword,
         newMasterPassword,
         ...meta,
       })
-      // Persist the new wrap to Supabase. If this fails, the local state is
+      // Persist the new wraps to Supabase. If this fails, the local state is
       // unchanged so the user can still unlock with the old pw.
       const { error } = await supabase
         .from('vault_users')
         .update({
           encrypted_dek: material.encryptedDek,
           iv_dek: material.ivDek,
+          encrypted_high_dek: material.encryptedHighDek,
+          iv_high_dek: material.ivHighDek,
           kdf_salt: material.kdfSalt,
           kdf_params: material.kdfParams,
           verifier_ciphertext: material.verifierCiphertext,
@@ -207,27 +356,59 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         .eq('user_id', user.id)
       if (error) {
         zero(material.dek)
+        zero(material.highDek)
         throw error
       }
-      // DEK is unchanged (same instance), vault stays unlocked, items still decrypt.
-      // Refresh local meta to the new values.
+      // Both key bytes are unchanged; only the wrap (KEK) changed. The DEK in
+      // the Touch ID Keychain item is therefore still valid — no re-store
+      // needed. Adopt the fresh key instances and zero the old ones. Changing
+      // the master pw also fully unlocks (both keys now in memory).
+      if (dekRef.current && dekRef.current !== material.dek) zero(dekRef.current)
+      if (highDekRef.current && highDekRef.current !== material.highDek) zero(highDekRef.current)
+      dekRef.current = material.dek
+      highDekRef.current = material.highDek
+      void setSessionDek(material.dek)
       setMeta({
         encryptedDek: material.encryptedDek,
         ivDek: material.ivDek,
+        encryptedHighDek: material.encryptedHighDek,
+        ivHighDek: material.ivHighDek,
         kdfSalt: material.kdfSalt,
         kdfParams: material.kdfParams,
         verifierCiphertext: material.verifierCiphertext,
         verifierIv: material.verifierIv,
       })
+      setStatus('unlocked')
       forceTick((t) => t + 1)
     },
     [user, meta],
   )
 
-  // Wipe DEK on tab close
+  // Biometric (Touch ID) management. All degrade to no-op/false off desktop.
+  const biometricAvailable = useCallback(() => desktopBiometricAvailable(), [])
+
+  const isBiometricEnrolled = useCallback(async () => {
+    if (!user) return false
+    return biometricExists(user.id)
+  }, [user])
+
+  const enableBiometric = useCallback(async () => {
+    if (!user) throw new Error('Must be signed in')
+    if (!dekRef.current) throw new Error('Unlock the vault before enabling Touch ID')
+    // Store ONLY the DEK — never the master password or highDek.
+    await biometricStore(user.id, dekRef.current)
+  }, [user])
+
+  const disableBiometric = useCallback(async () => {
+    if (!user) return
+    await biometricDelete(user.id)
+  }, [user])
+
+  // Wipe both keys on tab close
   useEffect(() => {
     const handler = () => {
       if (dekRef.current) zero(dekRef.current)
+      if (highDekRef.current) zero(highDekRef.current)
     }
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
@@ -265,16 +446,40 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       status,
       meta,
       dek: dekRef.current,
+      highDek: highDekRef.current,
+      highUnlocked: highDekRef.current !== null,
       setupVault,
       unlockVault,
+      unlockWithBiometric,
+      elevate,
       lockVault,
       verifyMasterPassword,
       changeMasterPassword,
       reload: loadMeta,
+      biometricAvailable,
+      isBiometricEnrolled,
+      enableBiometric,
+      disableBiometric,
     }),
-    // dekRef changes are surfaced via forceTick — meta + status reflect transitions
+    // `tick` forces a re-read of dekRef/highDekRef on every key transition.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [status, meta, setupVault, unlockVault, lockVault, verifyMasterPassword, changeMasterPassword, loadMeta],
+    [
+      tick,
+      status,
+      meta,
+      setupVault,
+      unlockVault,
+      unlockWithBiometric,
+      elevate,
+      lockVault,
+      verifyMasterPassword,
+      changeMasterPassword,
+      loadMeta,
+      biometricAvailable,
+      isBiometricEnrolled,
+      enableBiometric,
+      disableBiometric,
+    ],
   )
 
   return <VaultContext.Provider value={api}>{children}</VaultContext.Provider>

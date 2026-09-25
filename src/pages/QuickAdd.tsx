@@ -24,7 +24,7 @@ const VALUE_LABEL_BY_TYPE: Record<ItemType | string, string> = {
 
 export default function QuickAdd() {
   const { user } = useAuth()
-  const { dek } = useVault()
+  const { dek, highDek } = useVault()
   const toast = useToast()
   const navigate = useNavigate()
   const isDesktop = useIsDesktop()
@@ -87,7 +87,7 @@ export default function QuickAdd() {
           visibility_tier: tier,
           fields,
         },
-        dek,
+        { dek, highDek },
       )
       toast.success('Saved')
       if (isDesktop) {

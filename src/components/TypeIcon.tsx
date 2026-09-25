@@ -1,4 +1,4 @@
-import { FileText, Key, Lock, Sparkles } from 'lucide-react'
+import { CheckSquare, FileText, Key, Lock, Sparkles } from 'lucide-react'
 import type { ItemType } from '../lib/items'
 
 interface Props {
@@ -15,6 +15,8 @@ export default function TypeIcon({ type, size = 16, className = '' }: Props) {
       return <Key size={size} className={className} />
     case 'note':
       return <FileText size={size} className={className} />
+    case 'task':
+      return <CheckSquare size={size} className={className} />
     default:
       return <Sparkles size={size} className={className} />
   }
@@ -28,6 +30,8 @@ export function typeLabel(type: ItemType | string): string {
       return 'API key'
     case 'note':
       return 'Secure note'
+    case 'task':
+      return 'Task'
     default:
       return type
   }

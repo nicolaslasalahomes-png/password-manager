@@ -2,11 +2,17 @@
  * Zero-knowledge encryption layer.
  *
  * Master password (never sent to server) → PBKDF2 → KEK
- * KEK encrypts a randomly generated DEK (stored on server as ciphertext)
- * DEK encrypts every vault item (per-item random IV, AES-GCM-256)
+ * KEK wraps TWO randomly generated data keys:
+ *   - `dek`     → encrypts low + medium tier items. Can be stored in the
+ *                 macOS Secure Enclave for Touch ID unlock.
+ *   - `highDek` → encrypts high tier items only. NEVER leaves the master-
+ *                 password path — not stored in the Keychain. So high-tier
+ *                 items stay locked even after a Touch ID unlock until the
+ *                 master password is entered ("elevation").
  *
- * Server-side compromise reveals only ciphertext + KDF salt + verifier.
- * Without the master password, nothing decrypts.
+ * Both wrapped keys live in vault_users. Per-item encryption uses AES-GCM-256
+ * with a fresh random IV. Server-side compromise reveals only ciphertext +
+ * KDF salt + verifier. Without the master password, nothing decrypts.
  */
 
 const KDF_ITERATIONS = 600_000 // OWASP 2023 recommendation for PBKDF2-SHA256
@@ -101,17 +107,32 @@ async function aesGcmDecrypt(
   return new Uint8Array(pt)
 }
 
+/** Wrap a raw data key with the KEK. Returns base64 ciphertext + iv. */
+async function wrapKey(kek: CryptoKey, rawKey: Uint8Array): Promise<{ ct: string; iv: string }> {
+  const iv = randomBytes(IV_BYTES)
+  const ct = await aesGcmEncrypt(kek, iv, rawKey)
+  return { ct: toBase64(ct), iv: toBase64(iv) }
+}
+
+/** Unwrap a base64-wrapped data key with the KEK. */
+async function unwrapKey(kek: CryptoKey, ctB64: string, ivB64: string): Promise<Uint8Array> {
+  return aesGcmDecrypt(kek, fromBase64(ivB64), fromBase64(ctB64))
+}
+
 // ── Vault setup (first-run, when user picks their master password) ──────────
 
 export interface VaultSetupMaterial {
   encryptedDek: string
   ivDek: string
+  encryptedHighDek: string
+  ivHighDek: string
   kdfSalt: string
   kdfParams: KdfParams
   verifierCiphertext: string
   verifierIv: string
   /** Returned in-memory so the user is immediately unlocked after setup. */
   dek: Uint8Array
+  highDek: Uint8Array
 }
 
 export async function setupVault(masterPassword: string): Promise<VaultSetupMaterial> {
@@ -122,8 +143,9 @@ export async function setupVault(masterPassword: string): Promise<VaultSetupMate
   const kek = await deriveKek(masterPassword, kdfSalt, DEFAULT_KDF_PARAMS)
 
   const dek = randomBytes(DEK_BYTES)
-  const ivDek = randomBytes(IV_BYTES)
-  const encryptedDek = await aesGcmEncrypt(kek, ivDek, dek)
+  const highDek = randomBytes(DEK_BYTES)
+  const wrappedDek = await wrapKey(kek, dek)
+  const wrappedHighDek = await wrapKey(kek, highDek)
 
   const verifierIv = randomBytes(IV_BYTES)
   const verifierCiphertext = await aesGcmEncrypt(
@@ -133,13 +155,16 @@ export async function setupVault(masterPassword: string): Promise<VaultSetupMate
   )
 
   return {
-    encryptedDek: toBase64(encryptedDek),
-    ivDek: toBase64(ivDek),
+    encryptedDek: wrappedDek.ct,
+    ivDek: wrappedDek.iv,
+    encryptedHighDek: wrappedHighDek.ct,
+    ivHighDek: wrappedHighDek.iv,
     kdfSalt: toBase64(kdfSalt),
     kdfParams: DEFAULT_KDF_PARAMS,
     verifierCiphertext: toBase64(verifierCiphertext),
     verifierIv: toBase64(verifierIv),
     dek,
+    highDek,
   }
 }
 
@@ -153,13 +178,23 @@ export interface VaultUnlockArgs {
   verifierIv: string
   encryptedDek: string
   ivDek: string
+  /** Absent on legacy vaults created before the two-key model. */
+  encryptedHighDek?: string | null
+  ivHighDek?: string | null
 }
 
-export async function unlockVault(args: VaultUnlockArgs): Promise<{ dek: Uint8Array }> {
+/**
+ * Full unlock with the master password. Returns the DEK plus the highDek if
+ * the vault has one (legacy single-key vaults return highDek = null; the
+ * caller then generates one via `createHighDek` to migrate).
+ */
+export async function unlockVault(
+  args: VaultUnlockArgs,
+): Promise<{ dek: Uint8Array; highDek: Uint8Array | null }> {
   const salt = fromBase64(args.kdfSalt)
   const kek = await deriveKek(args.masterPassword, salt, args.kdfParams)
 
-  // Verifier check — fails fast on wrong password without touching the DEK
+  // Verifier check — fails fast on wrong password without touching the keys
   try {
     const verifierPt = await aesGcmDecrypt(
       kek,
@@ -173,8 +208,47 @@ export async function unlockVault(args: VaultUnlockArgs): Promise<{ dek: Uint8Ar
     throw new Error('Incorrect master password')
   }
 
-  const dek = await aesGcmDecrypt(kek, fromBase64(args.ivDek), fromBase64(args.encryptedDek))
-  return { dek }
+  const dek = await unwrapKey(kek, args.encryptedDek, args.ivDek)
+  const highDek =
+    args.encryptedHighDek && args.ivHighDek
+      ? await unwrapKey(kek, args.encryptedHighDek, args.ivHighDek)
+      : null
+  return { dek, highDek }
+}
+
+/**
+ * Migration helper: generate a fresh highDek and wrap it with the KEK derived
+ * from the master password + the EXISTING kdf salt (so it's unwrappable with
+ * the same master password as the dek). Used once for legacy single-key vaults.
+ */
+export async function createHighDek(args: {
+  masterPassword: string
+  kdfSalt: string
+  kdfParams: KdfParams
+}): Promise<{ highDek: Uint8Array; encryptedHighDek: string; ivHighDek: string }> {
+  const kek = await deriveKek(args.masterPassword, fromBase64(args.kdfSalt), args.kdfParams)
+  const highDek = randomBytes(DEK_BYTES)
+  const wrapped = await wrapKey(kek, highDek)
+  return { highDek, encryptedHighDek: wrapped.ct, ivHighDek: wrapped.iv }
+}
+
+/**
+ * Elevation: from a Touch-ID (standard) session, unwrap just the highDek by
+ * re-deriving the KEK from the master password. Verifies first.
+ */
+export async function elevateHighDek(args: {
+  masterPassword: string
+  kdfSalt: string
+  kdfParams: KdfParams
+  verifierCiphertext: string
+  verifierIv: string
+  encryptedHighDek: string
+  ivHighDek: string
+}): Promise<Uint8Array> {
+  const ok = await verifyMasterPassword(args)
+  if (!ok) throw new Error('Incorrect master password')
+  const kek = await deriveKek(args.masterPassword, fromBase64(args.kdfSalt), args.kdfParams)
+  return unwrapKey(kek, args.encryptedHighDek, args.ivHighDek)
 }
 
 /**
@@ -194,12 +268,14 @@ export async function changeMasterPassword(args: {
   verifierIv: string
   encryptedDek: string
   ivDek: string
+  encryptedHighDek?: string | null
+  ivHighDek?: string | null
 }): Promise<VaultSetupMaterial> {
   if (args.newMasterPassword.length < 8) {
     throw new Error('New master password must be at least 8 characters')
   }
-  // Verifies current password by attempting to decrypt the DEK. Throws on mismatch.
-  const { dek } = await unlockVault({
+  // Verifies current password by attempting to decrypt the keys. Throws on mismatch.
+  const { dek, highDek: existingHighDek } = await unlockVault({
     masterPassword: args.currentMasterPassword,
     kdfSalt: args.kdfSalt,
     kdfParams: args.kdfParams,
@@ -207,15 +283,18 @@ export async function changeMasterPassword(args: {
     verifierIv: args.verifierIv,
     encryptedDek: args.encryptedDek,
     ivDek: args.ivDek,
+    encryptedHighDek: args.encryptedHighDek,
+    ivHighDek: args.ivHighDek,
   })
+  // Legacy vault without a highDek yet → mint one now so post-change the
+  // vault always has both keys.
+  const highDek = existingHighDek ?? randomBytes(DEK_BYTES)
 
-  // Generate fresh salt + derive new KEK
+  // Generate fresh salt + derive new KEK, re-wrap BOTH keys
   const newSalt = randomBytes(SALT_BYTES)
   const newKek = await deriveKek(args.newMasterPassword, newSalt, DEFAULT_KDF_PARAMS)
-
-  // Re-wrap the SAME dek
-  const newIvDek = randomBytes(IV_BYTES)
-  const newEncryptedDek = await aesGcmEncrypt(newKek, newIvDek, dek)
+  const wrappedDek = await wrapKey(newKek, dek)
+  const wrappedHighDek = await wrapKey(newKek, highDek)
 
   // New verifier
   const newVerifierIv = randomBytes(IV_BYTES)
@@ -226,13 +305,16 @@ export async function changeMasterPassword(args: {
   )
 
   return {
-    encryptedDek: toBase64(newEncryptedDek),
-    ivDek: toBase64(newIvDek),
+    encryptedDek: wrappedDek.ct,
+    ivDek: wrappedDek.iv,
+    encryptedHighDek: wrappedHighDek.ct,
+    ivHighDek: wrappedHighDek.iv,
     kdfSalt: toBase64(newSalt),
     kdfParams: DEFAULT_KDF_PARAMS,
     verifierCiphertext: toBase64(newVerifierCt),
     verifierIv: toBase64(newVerifierIv),
     dek, // unchanged; vault stays unlocked
+    highDek, // unchanged (or freshly minted for legacy)
   }
 }
 

@@ -134,6 +134,11 @@ export function isQuickAddWindowSync(): boolean {
   return typeof window !== 'undefined' && window.location.hash === '#quick-add'
 }
 
+/** Synchronous label check for the 2FA popover (loaded with #2fa-popover). */
+export function is2faPopoverSync(): boolean {
+  return typeof window !== 'undefined' && window.location.hash === '#2fa-popover'
+}
+
 /** Show the quick-add window. Creates it on first call; shows + focuses on subsequent. */
 export async function openQuickAddWindow(): Promise<void> {
   if (!isDesktop()) return
@@ -208,6 +213,126 @@ export async function closeQuickAddWindow(): Promise<void> {
   }
 }
 
+// ── 2FA popover window (separate borderless mini-window) ────────────────────
+// Mirrors the quick-add window shape: dedicated WebviewWindow, loaded with
+// `index.html#2fa-popover`, ~360x280, alwaysOnTop, bottom-right. The poller
+// fires open2faPopover() the moment it detects a verification email; payload
+// is delivered via the `2fa://show` Tauri event so the same window can be
+// re-used for back-to-back emails (the popover handles dedup itself).
+
+const TWO_FA_POPOVER_LABEL = '2fa-popover'
+const TWO_FA_POPOVER_WIDTH = 380
+const TWO_FA_POPOVER_HEIGHT = 320
+const TWO_FA_POPOVER_EDGE_PADDING = 24
+
+export interface TwoFactorPayload {
+  /** Stable id to dedup back-to-back fires of the same email. */
+  gmailMessageId: string
+  accountId: string
+  accountEmail: string
+  fromName: string
+  subject: string
+  code?: string
+  magicLink?: string
+  receivedAt: string
+}
+
+export async function open2faPopover(payload: TwoFactorPayload): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { WebviewWindow, getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
+    const { primaryMonitor } = await import('@tauri-apps/api/window')
+    const { emit } = await import('@tauri-apps/api/event')
+
+    const existing = (await getAllWebviewWindows()).find((w) => w.label === TWO_FA_POPOVER_LABEL)
+    if (existing) {
+      await existing.show()
+      await existing.unminimize()
+      // Don't setFocus() — same reasoning as the first-create branch below:
+      // we want the popover visible without stealing the user's keyboard focus.
+      // Popover is listening for this event and will swap to the new payload.
+      await emit('2fa://show', payload)
+      return
+    }
+
+    // Bottom-right of primary monitor.
+    const monitor = await primaryMonitor()
+    const monW = monitor?.size.width ?? 1920
+    const monH = monitor?.size.height ?? 1080
+    const monX = monitor?.position.x ?? 0
+    const monY = monitor?.position.y ?? 0
+    const scaleFactor = monitor?.scaleFactor ?? 1
+    const logicalW = monW / scaleFactor
+    const logicalH = monH / scaleFactor
+
+    const x = Math.round(
+      monX / scaleFactor + logicalW - TWO_FA_POPOVER_WIDTH - TWO_FA_POPOVER_EDGE_PADDING,
+    )
+    const y = Math.round(
+      monY / scaleFactor + logicalH - TWO_FA_POPOVER_HEIGHT - TWO_FA_POPOVER_EDGE_PADDING - 40,
+    )
+
+    const w = new WebviewWindow(TWO_FA_POPOVER_LABEL, {
+      url: 'index.html#2fa-popover',
+      title: '2FA',
+      width: TWO_FA_POPOVER_WIDTH,
+      height: TWO_FA_POPOVER_HEIGHT,
+      x,
+      y,
+      resizable: false,
+      decorations: false,
+      transparent: false,
+      shadow: true,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      // focus: false → appear visibly without stealing keyboard focus from
+      // whatever the user is typing into in another app. Clicking the popover
+      // (Copy button, Open link) gives it focus naturally.
+      focus: false,
+      visible: false,
+    })
+
+    w.once('tauri://created', async () => {
+      await w.show()
+      // No setFocus() — see focus:false note above. The popover appears on
+      // top, the user's keyboard focus stays in their current app.
+      window.setTimeout(() => {
+        void emit('2fa://show', payload)
+      }, 80)
+    })
+    w.once('tauri://error', (e) => {
+      console.warn('[desktop] 2fa popover error', e)
+    })
+  } catch (err) {
+    console.warn('[desktop] open2faPopover failed', err)
+  }
+}
+
+export async function close2faPopover(): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
+    const w = (await getAllWebviewWindows()).find((w) => w.label === TWO_FA_POPOVER_LABEL)
+    if (w) await w.close()
+  } catch (err) {
+    console.warn('[desktop] close2faPopover failed', err)
+  }
+}
+
+/** Open an external URL in the user's default browser (Rust shells out via tauri-plugin-shell). */
+export async function openExternalUrl(url: string): Promise<void> {
+  if (!isDesktop()) {
+    window.open(url, '_blank', 'noopener')
+    return
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('open_url', { url })
+  } catch (err) {
+    console.warn('[desktop] openExternalUrl failed', err)
+  }
+}
+
 // ── Session DEK shared via Rust state ───────────────────────────────────────
 
 /** Push the unlocked DEK into Rust process memory so other windows can grab it. */
@@ -242,6 +367,84 @@ export async function clearSessionDek(): Promise<void> {
     await invoke('clear_session_dek')
   } catch (err) {
     console.warn('[desktop] clearSessionDek failed', err)
+  }
+}
+
+// ── Biometric unlock (macOS Touch ID via Secure Enclave Keychain) ───────────
+// The DEK (never the master password, never the highDek) is stored in a
+// biometric-gated Keychain item keyed by the Supabase user id. Retrieval
+// triggers a fresh Touch ID prompt every time. `biometryCurrentSet` access
+// control invalidates the item if the enrolled fingerprints change.
+
+/** True only on a Mac with Touch ID hardware the app can evaluate. */
+export async function biometricAvailable(): Promise<boolean> {
+  if (!isDesktop()) return false
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    return (await invoke('biometric_available')) as boolean
+  } catch (err) {
+    console.warn('[desktop] biometricAvailable failed', err)
+    return false
+  }
+}
+
+/** Whether a biometric DEK item exists for this account. Does NOT prompt. */
+export async function biometricExists(account: string): Promise<boolean> {
+  if (!isDesktop()) return false
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    return (await invoke('biometric_exists', { account })) as boolean
+  } catch (err) {
+    console.warn('[desktop] biometricExists failed', err)
+    return false
+  }
+}
+
+/** Tauri rejects `Result<_, String>` commands with a bare string, not an Error.
+ *  Normalise so call sites can rely on `instanceof Error` + `.message`. */
+function toError(err: unknown, fallback: string): Error {
+  if (err instanceof Error) return err
+  if (typeof err === 'string') return new Error(err)
+  return new Error(fallback)
+}
+
+/**
+ * Store the DEK in the biometric-gated Keychain (delete-then-add to overwrite).
+ * Throws on failure — the caller must surface enrollment errors to the user.
+ */
+export async function biometricStore(account: string, secret: Uint8Array): Promise<void> {
+  if (!isDesktop()) throw new Error('Touch ID is only available in the desktop app')
+  const { invoke } = await import('@tauri-apps/api/core')
+  try {
+    await invoke('biometric_store', { account, secret: Array.from(secret) })
+  } catch (err) {
+    throw toError(err, 'Could not store Touch ID credential')
+  }
+}
+
+/**
+ * Retrieve the DEK from the Keychain. Triggers the Touch ID prompt. Throws if
+ * the user cancels, the fingerprint fails, or the item was invalidated.
+ */
+export async function biometricRetrieve(account: string): Promise<Uint8Array> {
+  if (!isDesktop()) throw new Error('Touch ID is only available in the desktop app')
+  const { invoke } = await import('@tauri-apps/api/core')
+  try {
+    const result = (await invoke('biometric_retrieve', { account })) as number[]
+    return new Uint8Array(result)
+  } catch (err) {
+    throw toError(err, 'Touch ID retrieve failed')
+  }
+}
+
+/** Remove the biometric DEK item (disable Touch ID). Throws on failure. */
+export async function biometricDelete(account: string): Promise<void> {
+  if (!isDesktop()) return
+  const { invoke } = await import('@tauri-apps/api/core')
+  try {
+    await invoke('biometric_delete', { account })
+  } catch (err) {
+    throw toError(err, 'Could not remove Touch ID credential')
   }
 }
 

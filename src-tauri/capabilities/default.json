@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default Keyring permissions",
-  "windows": ["main", "quick-add"],
+  "windows": ["main", "quick-add", "2fa-popover"],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -17,15 +17,21 @@
     "core:window:allow-scale-factor",
     "core:window:allow-primary-monitor",
     "core:window:allow-start-dragging",
+    "core:window:allow-is-focused",
     "core:webview:allow-create-webview-window",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
+    "core:event:allow-emit",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
     "global-shortcut:allow-unregister-all",
     "global-shortcut:allow-is-registered",
     "store:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-request-permission",
+    "notification:allow-is-permission-granted"
   ]
 }

@@ -1,11 +1,21 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { ChevronDown, ChevronRight, FolderClosed, FolderOpen, Search, ShieldOff } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  FolderClosed,
+  FolderOpen,
+  Loader2,
+  RefreshCw,
+  Search,
+  ShieldOff,
+} from 'lucide-react'
 import Layout from '../components/Layout'
 import TypeIcon, { typeLabel } from '../components/TypeIcon'
 import TierBadge from '../components/TierBadge'
 import { listItems, type VaultItemRow } from '../lib/items'
 import { useToast } from '../state/ToastContext'
+import { isDesktop } from '../lib/desktop'
 
 const NO_FOLDER = '__no_folder__'
 
@@ -28,19 +38,51 @@ export default function VaultList() {
   const typeFilter = searchParams.get('type') // null = "All items"
 
   const [items, setItems] = useState<VaultItemRow[] | null>(null)
+  const [reloading, setReloading] = useState(false)
   const [query, setQuery] = useState('')
   const [folderFilter, setFolderFilter] = useState<string>('all')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const toast = useToast()
 
-  useEffect(() => {
-    listItems()
-      .then(setItems)
-      .catch((err) => {
+  const loadItems = useCallback(
+    async (silent = false) => {
+      if (!silent) setReloading(true)
+      try {
+        const rows = await listItems()
+        setItems(rows)
+      } catch (err) {
         toast.error(err instanceof Error ? err.message : 'Failed to load items')
-        setItems([])
-      })
-  }, [toast])
+        setItems((prev) => prev ?? [])
+      } finally {
+        if (!silent) setReloading(false)
+      }
+    },
+    [toast],
+  )
+
+  // Initial load
+  useEffect(() => {
+    void loadItems(true)
+  }, [loadItems])
+
+  // Auto-reload when the popover (or another surface) signals a change
+  useEffect(() => {
+    if (!isDesktop()) return
+    let unlisten: (() => void) | null = null
+    ;(async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen('vault://items-changed', () => {
+          void loadItems(true)
+        })
+      } catch {
+        /* non-fatal */
+      }
+    })()
+    return () => {
+      unlisten?.()
+    }
+  }, [loadItems])
 
   // Reset folder filter when switching sections
   useEffect(() => {
@@ -124,6 +166,19 @@ export default function VaultList() {
           {sectionCount !== null && (
             <span className="text-sm text-ink-500">{sectionCount}</span>
           )}
+          <button
+            onClick={() => void loadItems()}
+            disabled={reloading}
+            className="btn-ghost ml-auto !px-2 !py-1 !text-xs"
+            title="Reload items from the vault"
+          >
+            {reloading ? (
+              <Loader2 size={12} className="animate-spin" />
+            ) : (
+              <RefreshCw size={12} />
+            )}
+            {reloading ? 'Reloading' : 'Refresh'}
+          </button>
         </div>
         {sectionSubtitle && <p className="mt-0.5 text-xs text-ink-400">{sectionSubtitle}</p>}
       </header>

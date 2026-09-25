@@ -52,6 +52,8 @@ type Phase =
 interface VaultUsersRow {
   encrypted_dek: string
   iv_dek: string
+  encrypted_high_dek: string | null
+  iv_high_dek: string | null
   kdf_salt: string
   kdf_params: KdfParams
   verifier_ciphertext: string
@@ -62,6 +64,8 @@ function rowToMeta(row: VaultUsersRow): VaultMeta {
   return {
     encryptedDek: row.encrypted_dek,
     ivDek: row.iv_dek,
+    encryptedHighDek: row.encrypted_high_dek,
+    ivHighDek: row.iv_high_dek,
     kdfSalt: row.kdf_salt,
     kdfParams: row.kdf_params,
     verifierCiphertext: row.verifier_ciphertext,
@@ -72,7 +76,9 @@ function rowToMeta(row: VaultUsersRow): VaultMeta {
 async function loadMeta(user: User): Promise<VaultMeta | null> {
   const { data, error } = await supabase
     .from('vault_users')
-    .select('encrypted_dek, iv_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv')
+    .select(
+      'encrypted_dek, iv_dek, encrypted_high_dek, iv_high_dek, kdf_salt, kdf_params, verifier_ciphertext, verifier_iv',
+    )
     .eq('user_id', user.id)
     .maybeSingle()
   if (error || !data) return null
@@ -272,7 +278,9 @@ function UnlockForm({
 
 function QuickAddForm({ user, dek }: { user: User; dek: Uint8Array }) {
   const toast = useToast()
-  const [type, setType] = useState<ItemType | string>('login')
+  // Default to Note — user takes a lot of notes; password creation is the
+  // slower deliberate flow (use the main app for that).
+  const [type, setType] = useState<ItemType | string>('note')
   const [title, setTitle] = useState('')
   const [username, setUsername] = useState('')
   const [value, setValue] = useState('')
@@ -281,6 +289,9 @@ function QuickAddForm({ user, dek }: { user: User; dek: Uint8Array }) {
   const [revealed, setRevealed] = useState(false)
   const [folderOptions, setFolderOptions] = useState<string[]>([])
   const [submitting, setSubmitting] = useState(false)
+  // Optional task fields — visible only when type=note. Empty = plain note.
+  const [dueAt, setDueAt] = useState<string>('') // datetime-local string
+  const [priority, setPriority] = useState<'' | 'low' | 'medium' | 'high'>('')
 
   useEffect(() => {
     listFolders().then(setFolderOptions).catch(() => {})
@@ -292,30 +303,58 @@ function QuickAddForm({ user, dek }: { user: User; dek: Uint8Array }) {
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault()
-    if (!title.trim() || !value) {
-      toast.error('Title and value are required')
+    if (!title.trim()) {
+      toast.error('Title is required')
+      return
+    }
+    // For non-note types the value field is the actual secret (password / key)
+    // and must be present. Notes are free-form — body can be empty.
+    if (type !== 'note' && !value) {
+      toast.error(`${valueLabel} is required`)
       return
     }
     setSubmitting(true)
     try {
-      const fields: Record<string, string> = { [valueFieldKey]: value }
+      const fields: Record<string, string> = {}
+      if (value) fields[valueFieldKey] = value
       if (showUsername && username) fields.username = username
+
+      // A note with a due date is a task — store it as type='task' so it's
+      // consistent with tasks made from the main "New item" form, and so it
+      // lands in the To-Do / Calendar surfaces with the right icon.
+      const effectiveType = type === 'note' && dueAt ? 'task' : type
 
       await createItem(
         user.id,
         {
-          type,
+          type: effectiveType,
           title: title.trim(),
           folder: folder.trim() || null,
           visibility_tier: tier,
           fields,
+          // Only attach due/priority when type=note. The form hides these
+          // controls for other types, but be defensive in case state lingers.
+          due_at: type === 'note' && dueAt ? new Date(dueAt).toISOString() : null,
+          priority: type === 'note' && priority ? priority : null,
         },
-        dek,
+        // The popover only ever holds the standard DEK (from the Rust session);
+        // highDek never leaves the main window, so high-tier items can't be
+        // created here. The tier selector below is limited to low/medium.
+        { dek, highDek: null },
       )
+      // Tell the main window to refresh its list
+      try {
+        const { emit } = await import('@tauri-apps/api/event')
+        await emit('vault://items-changed')
+      } catch {
+        /* non-fatal */
+      }
       toast.success('Saved')
       setTitle('')
       setUsername('')
       setValue('')
+      setDueAt('')
+      setPriority('')
       // small delay so toast renders before window hides
       window.setTimeout(() => void closeQuickAddWindow(), 250)
     } catch (err) {
@@ -337,7 +376,7 @@ function QuickAddForm({ user, dek }: { user: User; dek: Uint8Array }) {
       className="space-y-3"
     >
       <div className="grid grid-cols-4 gap-1.5">
-        {(['login', 'api_key', 'note', 'other'] as const).map((t) => (
+        {(['note', 'login', 'api_key', 'other'] as const).map((t) => (
           <button
             type="button"
             key={t}
@@ -445,9 +484,37 @@ function QuickAddForm({ user, dek }: { user: User; dek: Uint8Array }) {
         >
           <option value="low">Low visibility</option>
           <option value="medium">Medium visibility</option>
-          <option value="high">High visibility</option>
         </select>
       </div>
+
+      {type === 'note' && (
+        <div className="rounded-md border border-ink-800 bg-ink-900/40 p-2.5">
+          <p className="mb-1.5 text-[10px] uppercase tracking-wider text-ink-400">
+            Optional task fields
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            <input
+              type="datetime-local"
+              value={dueAt}
+              onChange={(e) => setDueAt(e.target.value)}
+              className="input !py-1.5 text-xs"
+              title="Due date / time"
+            />
+            <select
+              value={priority}
+              onChange={(e) => setPriority(e.target.value as '' | 'low' | 'medium' | 'high')}
+              className="input !py-1.5 text-xs"
+              title="Priority"
+              disabled={!dueAt}
+            >
+              <option value="">No priority</option>
+              <option value="low">Low priority</option>
+              <option value="medium">Medium priority</option>
+              <option value="high">High priority</option>
+            </select>
+          </div>
+        </div>
+      )}
 
       <button type="submit" className="btn-primary w-full !py-1.5" disabled={submitting}>
         <Save size={14} />

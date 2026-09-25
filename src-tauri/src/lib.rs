@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod browser;
+mod oauth;
+
 #[cfg(target_os = "macos")]
 mod macos_focus {
     use objc2::{class, msg_send, runtime::AnyObject};
@@ -52,7 +55,238 @@ mod macos_focus {
     }
 }
 
+/// macOS biometric (Touch ID) Keychain access.
+///
+/// Stores the vault DEK in a `kSecClassGenericPassword` item gated by a
+/// `biometryCurrentSet` access-control policy and `WhenUnlockedThisDeviceOnly`
+/// accessibility. Reading it triggers a fresh Touch ID prompt every time;
+/// changing the enrolled fingerprints invalidates the item. The master
+/// password (and the highDek) are NEVER stored here.
+#[cfg(target_os = "macos")]
+mod macos_biometric {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::base::CFTypeRef;
+    use core_foundation_sys::data::CFDataRef;
+    use core_foundation_sys::dictionary::CFDictionaryRef;
+    use core_foundation_sys::error::CFErrorRef;
+    use core_foundation_sys::string::CFStringRef;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, msg_send_id};
+    use std::ptr;
+
+    type OSStatus = i32;
+
+    const ERR_SEC_SUCCESS: OSStatus = 0;
+    const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
+    const ERR_SEC_USER_CANCELED: OSStatus = -128;
+    const ERR_SEC_AUTH_FAILED: OSStatus = -25293;
+    const ERR_SEC_INTERACTION_NOT_ALLOWED: OSStatus = -25308;
+
+    /// kSecAccessControlBiometryCurrentSet — invalidated if the enrolled set of
+    /// fingerprints changes.
+    const BIOMETRY_CURRENT_SET: usize = 1 << 3;
+    /// LAPolicyDeviceOwnerAuthenticationWithBiometrics.
+    const LA_POLICY_BIOMETRICS: isize = 1;
+
+    extern "C" {
+        fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+        fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+        fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
+        fn SecAccessControlCreateWithFlags(
+            allocator: CFTypeRef,
+            protection: CFTypeRef,
+            flags: usize,
+            error: *mut CFErrorRef,
+        ) -> CFTypeRef;
+
+        static kSecClass: CFStringRef;
+        static kSecClassGenericPassword: CFStringRef;
+        static kSecAttrService: CFStringRef;
+        static kSecAttrAccount: CFStringRef;
+        static kSecValueData: CFStringRef;
+        static kSecReturnData: CFStringRef;
+        static kSecReturnAttributes: CFStringRef;
+        static kSecMatchLimit: CFStringRef;
+        static kSecMatchLimitOne: CFStringRef;
+        static kSecAttrAccessControl: CFStringRef;
+        static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFStringRef;
+        static kSecUseAuthenticationUI: CFStringRef;
+        static kSecUseAuthenticationUISkip: CFStringRef;
+        static kSecUseOperationPrompt: CFStringRef;
+    }
+
+    /// Borrow a static (get-rule) CFStringRef constant as a CFType for building
+    /// query/attribute dictionaries.
+    unsafe fn k(r: CFStringRef) -> CFType {
+        CFType::wrap_under_get_rule(r as CFTypeRef)
+    }
+
+    fn map_status(status: OSStatus) -> String {
+        match status {
+            ERR_SEC_USER_CANCELED => "Touch ID was cancelled".to_string(),
+            ERR_SEC_AUTH_FAILED => "Touch ID authentication failed".to_string(),
+            ERR_SEC_ITEM_NOT_FOUND => "No Touch ID credential is stored".to_string(),
+            other => format!("Keychain error {}", other),
+        }
+    }
+
+    /// True iff this Mac can evaluate biometrics (has Touch ID and it's set up).
+    pub fn available() -> bool {
+        unsafe {
+            let ctx: Retained<AnyObject> = msg_send_id![class!(LAContext), new];
+            let mut error: *mut AnyObject = ptr::null_mut();
+            let can: bool = msg_send![&*ctx, canEvaluatePolicy: LA_POLICY_BIOMETRICS, error: &mut error];
+            can
+        }
+    }
+
+    /// Store `secret` under (service, account) with biometric access control.
+    /// Delete-then-add so a re-enable overwrites cleanly.
+    pub fn store(service: &str, account: &str, secret: &[u8]) -> Result<(), String> {
+        unsafe {
+            let _ = delete(service, account);
+
+            let mut err: CFErrorRef = ptr::null_mut();
+            let access = SecAccessControlCreateWithFlags(
+                ptr::null(),
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly as CFTypeRef,
+                BIOMETRY_CURRENT_SET,
+                &mut err,
+            );
+            if access.is_null() {
+                return Err("Could not create a biometric access policy".to_string());
+            }
+            let access_cf = CFType::wrap_under_create_rule(access);
+
+            let service_cf = CFString::new(service);
+            let account_cf = CFString::new(account);
+            let data_cf = CFData::from_buffer(secret);
+
+            let pairs: [(CFType, CFType); 5] = [
+                (k(kSecClass), k(kSecClassGenericPassword)),
+                (k(kSecAttrService), service_cf.as_CFType()),
+                (k(kSecAttrAccount), account_cf.as_CFType()),
+                (k(kSecValueData), data_cf.as_CFType()),
+                (k(kSecAttrAccessControl), access_cf),
+            ];
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+
+            let mut result: CFTypeRef = ptr::null_mut();
+            let status = SecItemAdd(dict.as_concrete_TypeRef(), &mut result);
+            if !result.is_null() {
+                let _ = CFType::wrap_under_create_rule(result);
+            }
+            if status != ERR_SEC_SUCCESS {
+                return Err(map_status(status));
+            }
+            Ok(())
+        }
+    }
+
+    /// Retrieve the secret, triggering a Touch ID prompt (item has biometric ACL).
+    pub fn retrieve(service: &str, account: &str, prompt: &str) -> Result<Vec<u8>, String> {
+        unsafe {
+            let service_cf = CFString::new(service);
+            let account_cf = CFString::new(account);
+            let prompt_cf = CFString::new(prompt);
+
+            let pairs: [(CFType, CFType); 6] = [
+                (k(kSecClass), k(kSecClassGenericPassword)),
+                (k(kSecAttrService), service_cf.as_CFType()),
+                (k(kSecAttrAccount), account_cf.as_CFType()),
+                (k(kSecReturnData), CFBoolean::true_value().as_CFType()),
+                (k(kSecMatchLimit), k(kSecMatchLimitOne)),
+                (k(kSecUseOperationPrompt), prompt_cf.as_CFType()),
+            ];
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+
+            let mut result: CFTypeRef = ptr::null_mut();
+            let status = SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result);
+            if status != ERR_SEC_SUCCESS {
+                return Err(map_status(status));
+            }
+            if result.is_null() {
+                return Err("Keychain returned no data".to_string());
+            }
+            let data = CFData::wrap_under_create_rule(result as CFDataRef);
+            Ok(data.bytes().to_vec())
+        }
+    }
+
+    /// Whether an item exists for (service, account). Uses `...UISkip` so it
+    /// NEVER prompts — even an item that would require auth reports as present.
+    pub fn exists(service: &str, account: &str) -> bool {
+        unsafe {
+            let service_cf = CFString::new(service);
+            let account_cf = CFString::new(account);
+            let pairs: [(CFType, CFType); 6] = [
+                (k(kSecClass), k(kSecClassGenericPassword)),
+                (k(kSecAttrService), service_cf.as_CFType()),
+                (k(kSecAttrAccount), account_cf.as_CFType()),
+                (k(kSecReturnAttributes), CFBoolean::true_value().as_CFType()),
+                (k(kSecMatchLimit), k(kSecMatchLimitOne)),
+                (k(kSecUseAuthenticationUI), k(kSecUseAuthenticationUISkip)),
+            ];
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+            let mut result: CFTypeRef = ptr::null_mut();
+            let status = SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result);
+            if !result.is_null() {
+                let _ = CFType::wrap_under_create_rule(result);
+            }
+            status == ERR_SEC_SUCCESS || status == ERR_SEC_INTERACTION_NOT_ALLOWED
+        }
+    }
+
+    /// Remove the item. errSecItemNotFound is treated as success (already gone).
+    pub fn delete(service: &str, account: &str) -> Result<(), String> {
+        unsafe {
+            let service_cf = CFString::new(service);
+            let account_cf = CFString::new(account);
+            let pairs: [(CFType, CFType); 3] = [
+                (k(kSecClass), k(kSecClassGenericPassword)),
+                (k(kSecAttrService), service_cf.as_CFType()),
+                (k(kSecAttrAccount), account_cf.as_CFType()),
+            ];
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+            let status = SecItemDelete(dict.as_concrete_TypeRef());
+            if status == ERR_SEC_SUCCESS || status == ERR_SEC_ITEM_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(map_status(status))
+            }
+        }
+    }
+}
+
+/// Non-macOS stub: Touch ID is unavailable, everything degrades gracefully.
+#[cfg(not(target_os = "macos"))]
+mod macos_biometric {
+    pub fn available() -> bool {
+        false
+    }
+    pub fn store(_service: &str, _account: &str, _secret: &[u8]) -> Result<(), String> {
+        Err("Touch ID is only available on macOS".to_string())
+    }
+    pub fn retrieve(_service: &str, _account: &str, _prompt: &str) -> Result<Vec<u8>, String> {
+        Err("Touch ID is only available on macOS".to_string())
+    }
+    pub fn exists(_service: &str, _account: &str) -> bool {
+        false
+    }
+    pub fn delete(_service: &str, _account: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 const BUNDLE_ID: &str = "com.nicolassut.keyring";
+
+/// Keychain service name for biometric items. One item per Supabase user id.
+const KEYCHAIN_SERVICE: &str = BUNDLE_ID;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -118,6 +352,33 @@ fn clear_session_dek(state: tauri::State<'_, SessionState>) {
         }
         *guard = None;
     }
+}
+
+// ── Biometric (Touch ID) commands ───────────────────────────────────────────
+
+#[tauri::command]
+fn biometric_available() -> bool {
+    macos_biometric::available()
+}
+
+#[tauri::command]
+fn biometric_store(account: String, secret: Vec<u8>) -> Result<(), String> {
+    macos_biometric::store(KEYCHAIN_SERVICE, &account, &secret)
+}
+
+#[tauri::command]
+fn biometric_retrieve(account: String) -> Result<Vec<u8>, String> {
+    macos_biometric::retrieve(KEYCHAIN_SERVICE, &account, "Unlock your Keyring vault")
+}
+
+#[tauri::command]
+fn biometric_exists(account: String) -> bool {
+    macos_biometric::exists(KEYCHAIN_SERVICE, &account)
+}
+
+#[tauri::command]
+fn biometric_delete(account: String) -> Result<(), String> {
+    macos_biometric::delete(KEYCHAIN_SERVICE, &account)
 }
 
 /// Called by the JS hotkey handler right before showing the popover.
@@ -216,6 +477,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -275,7 +538,14 @@ pub fn run() {
             get_session_dek,
             clear_session_dek,
             record_main_visibility,
-            handle_popover_close
+            handle_popover_close,
+            biometric_available,
+            biometric_store,
+            biometric_retrieve,
+            biometric_exists,
+            biometric_delete,
+            oauth::start_google_oauth,
+            browser::open_url
         ])
         .on_window_event(|window, event| {
             // Close button hides the window (like macOS apps), doesn't quit.

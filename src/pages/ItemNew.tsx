@@ -2,10 +2,17 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, Eye, EyeOff, RefreshCw, Save, Trash2 } from 'lucide-react'
 import Layout from '../components/Layout'
+import DateTimePicker from '../components/DateTimePicker'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
-import { createItem, listFolders, type ItemType, type VisibilityTier } from '../lib/items'
+import {
+  createItem,
+  listFolders,
+  type ItemType,
+  type Priority,
+  type VisibilityTier,
+} from '../lib/items'
 import { generatePassword } from '../lib/generate'
 
 interface FieldDef {
@@ -33,6 +40,8 @@ function fieldsForType(type: ItemType | string): FieldDef[] {
       ]
     case 'note':
       return [{ key: 'body', label: 'Note body', multiline: true }]
+    case 'task':
+      return [{ key: 'body', label: 'Task details', multiline: true }]
     default:
       return [{ key: 'notes', label: 'Notes', multiline: true }]
   }
@@ -40,7 +49,7 @@ function fieldsForType(type: ItemType | string): FieldDef[] {
 
 export default function ItemNew() {
   const { user } = useAuth()
-  const { dek } = useVault()
+  const { dek, highDek } = useVault()
   const toast = useToast()
   const navigate = useNavigate()
 
@@ -55,6 +64,10 @@ export default function ItemNew() {
   const [revealedKeys, setRevealedKeys] = useState<Set<string>>(new Set())
   const [customFields, setCustomFields] = useState<{ key: string; value: string }[]>([])
   const [submitting, setSubmitting] = useState(false)
+  // Task fields (only used when type === 'task')
+  const [dueAt, setDueAt] = useState('')
+  const [priority, setPriority] = useState<Priority>('medium')
+  const isTask = type === 'task'
 
   const fieldDefs = useMemo(() => fieldsForType(type), [type])
 
@@ -76,6 +89,10 @@ export default function ItemNew() {
     if (!user || !dek) return
     if (!title.trim()) {
       toast.error('Title is required')
+      return
+    }
+    if (isTask && !dueAt) {
+      toast.error('A task needs a due date')
       return
     }
     setSubmitting(true)
@@ -105,8 +122,10 @@ export default function ItemNew() {
           tags,
           visibility_tier: tier,
           fields,
+          due_at: isTask && dueAt ? new Date(dueAt).toISOString() : null,
+          priority: isTask ? priority : null,
         },
-        dek,
+        { dek, highDek },
       )
       toast.success('Item saved')
       navigate(`/vault/${created.id}`, { replace: true })
@@ -144,6 +163,7 @@ export default function ItemNew() {
               <option value="login">Login</option>
               <option value="api_key">API key</option>
               <option value="note">Secure note</option>
+              <option value="task">Task / To-Do</option>
               <option value="other">Other</option>
             </select>
           </div>
@@ -208,6 +228,37 @@ export default function ItemNew() {
             />
           </div>
         </div>
+
+        {/* Task settings (only for tasks) */}
+        {isTask && (
+          <div className="rounded-lg border border-accent-600/30 bg-accent-950/20 p-4">
+            <h2 className="mb-3 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-accent-300">
+              Task settings
+            </h2>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <label className="label">Due date &amp; time</label>
+                <DateTimePicker value={dueAt} onChange={setDueAt} />
+              </div>
+              <div>
+                <label className="label">Priority</label>
+                <select
+                  value={priority}
+                  onChange={(e) => setPriority(e.target.value as Priority)}
+                  className="input"
+                >
+                  <option value="low">Low — 1 reminder/day</option>
+                  <option value="medium">Medium — 2 reminders/day</option>
+                  <option value="high">High — 4 reminders/day</option>
+                </select>
+              </div>
+            </div>
+            <p className="mt-2 text-[11px] text-ink-400">
+              Reminders fire during your work hours (set in Settings) and stop once you mark the
+              task complete in the To-Do tab.
+            </p>
+          </div>
+        )}
 
         {/* Type-specific fields */}
         <div className="border-t border-ink-800 pt-5">
