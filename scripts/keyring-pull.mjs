@@ -10,6 +10,8 @@
  * (600). Idempotent by row id: a row already in the file is not written again. Rows are acked
  * (marked fetched) only after they are written. On a 5xx it backs off (10, 20, 40 ... max 60 min)
  * so a struggling nano database is not hammered.
+ * The log (launchd: ~/Library/Logs/keyring-pull.log) carries ids, counts and status only: never
+ * reply text and never keys. A new reply also touches keyring-replies.new (empty) next to the file.
  */
 import { readFileSync, writeFileSync, appendFileSync, existsSync, statSync, chmodSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -23,6 +25,8 @@ const FUNCTION_URL = 'https://wwylhsetxpopxmtupfhn.supabase.co/functions/v1/keyr
 const DIR = path.join(homedir(), '.config/keyring-inbox')
 const BACKOFF_FILE = path.join(DIR, 'pull-backoff.json')
 export const REPLIES_FILE = path.join(homedir(), '.claude/issues/lasalahomes/keyring-replies.jsonl')
+/** Touched (empty) whenever a new reply is written, so the coordinator notices between lists. */
+export const NEW_MARKER = path.join(homedir(), '.claude/issues/lasalahomes/keyring-replies.new')
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 const unb64 = (s) => Uint8Array.from(Buffer.from(s, 'base64'))
@@ -34,7 +38,12 @@ export function replyHeader(e) {
 /** Open one row. Throws on anything that does not check out. */
 export async function openReply(row, readerPrivateJwk, owner = OWNER) {
   if (row.user_id !== owner) throw new Error(`row ${row.id}: not the owner's`)
-  const e = JSON.parse(row.envelope)
+  let e
+  try {
+    e = JSON.parse(row.envelope)
+  } catch {
+    throw new Error(`row ${row.id}: envelope is not valid JSON`)
+  }
   if (e.v !== 1 || e.list_no !== row.list_no || e.item_id !== row.item_id) throw new Error(`row ${row.id}: envelope does not match its row`)
   const priv = await subtle.importKey('jwk', readerPrivateJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])
   const epk = await subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x: e.epk.x, y: e.epk.y }, { name: 'ECDH', namedCurve: 'P-256' }, false, [])
@@ -53,7 +62,13 @@ export async function openReply(row, readerPrivateJwk, owner = OWNER) {
   } catch {
     throw new Error(`row ${row.id}: could not be opened (tampered, or not sealed to this reader)`)
   }
-  const p = JSON.parse(dec.decode(plain).trimEnd())
+  let p
+  try {
+    p = JSON.parse(dec.decode(plain).trimEnd())
+  } catch {
+    // Never let a parse error quote the decrypted text into the log.
+    throw new Error(`row ${row.id}: sealed reply is not valid JSON`)
+  }
   if (p.v !== 1 || p.list_no !== row.list_no || p.item_id !== row.item_id || typeof p.text !== 'string') {
     throw new Error(`row ${row.id}: sealed reply does not match its row`)
   }
@@ -123,9 +138,14 @@ async function main() {
   try {
     const { rows } = await call({ action: 'get', limit: 20 }, secret)
     if (b.minutes) writeFileSync(BACKOFF_FILE, JSON.stringify({ until: 0, minutes: 0 }), { mode: 0o600 })
-    if (!rows.length) return
+    const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ')
+    if (!rows.length) {
+      console.log(`${stamp} 0 new`)
+      return
+    }
     const seen = seenIds(existsSync(REPLIES_FILE) ? readFileSync(REPLIES_FILE, 'utf8') : '')
     const done = []
+    let written = 0
     for (const row of rows) {
       if (seen.has(row.id)) {
         done.push(row.id)
@@ -135,14 +155,16 @@ async function main() {
         const r = await openReply(row, readerPrivateJwk)
         appendFileSync(REPLIES_FILE, JSON.stringify({ ...r, received_at: new Date().toISOString() }) + '\n', { mode: 0o600 })
         done.push(row.id)
-        console.log(`reply ${r.item_id} (List ${r.list_no}): ${r.text.slice(0, 60)}`)
+        written++
       } catch (e) {
         // Not acked: it stays unfetched and visible, and is reported every run until someone looks.
         console.error(`keyring-pull: ${e.message}`)
       }
     }
     if (existsSync(REPLIES_FILE)) chmodSync(REPLIES_FILE, 0o600)
+    if (written) writeFileSync(NEW_MARKER, '', { mode: 0o600 })
     if (done.length) await call({ action: 'ack', ids: done }, secret)
+    console.log(`${stamp} ${rows.length} fetched, ${written} new, ${done.length} acked, ${rows.length - done.length} left for a look`)
   } catch (e) {
     if (e.retryable || e.name === 'TimeoutError' || e.name === 'TypeError') {
       const minutes = Math.min(60, b.minutes ? b.minutes * 2 : 10)
