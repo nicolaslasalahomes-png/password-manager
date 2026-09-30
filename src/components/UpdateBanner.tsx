@@ -46,7 +46,7 @@ export default function UpdateBanner({ version, currentVersion, onDismiss }: Pro
           <>
             <button
               onClick={onInstall}
-              className="inline-flex items-center gap-1.5 rounded-md bg-accent-600 px-3 py-1 text-xs font-medium text-white hover:bg-accent-500"
+              className="inline-flex items-center gap-1.5 rounded-md bg-accent-600 px-3 py-1 text-xs font-medium text-on-accent hover:bg-accent-500"
             >
               Install &amp; restart
             </button>

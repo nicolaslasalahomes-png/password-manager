@@ -9,6 +9,7 @@ import {
   KeyRound,
   Loader2,
   LogOut,
+  Palette,
   ShieldCheck,
   Sparkles,
 } from 'lucide-react'
@@ -38,6 +39,17 @@ import {
   showWindow,
 } from '../lib/desktop'
 import { useNavigate } from 'react-router-dom'
+import {
+  type Theme,
+  type TextTone,
+  NIGHT,
+  PRESETS,
+  effectiveBackground,
+  loadTheme,
+  matchPreset,
+  parseHex,
+  saveTheme,
+} from '../lib/theme'
 
 const HOTKEY_STORE_KEY = 'quickAddHotkey'
 
@@ -129,6 +141,10 @@ export default function Settings() {
       </header>
 
       <div className="space-y-6">
+        <Section title="Appearance" icon={<Palette size={14} />}>
+          <AppearanceControl />
+        </Section>
+
         <Section title="Account" icon={<ShieldCheck size={14} />}>
           <Row label="Signed in as">
             <span className="font-mono text-sm text-ink-100">{user?.email}</span>
@@ -782,6 +798,118 @@ function Row({
         {hint && <p className="mt-0.5 text-xs text-ink-400">{hint}</p>}
       </div>
       <div className="flex-shrink-0">{children}</div>
+    </div>
+  )
+}
+
+function AppearanceControl() {
+  const [theme, setTheme] = useState<Theme>(() => loadTheme())
+  const preset = matchPreset(theme)
+  const shownBg = effectiveBackground(theme)
+  const adjusted = shownBg.toLowerCase() !== theme.background.toLowerCase()
+
+  function update(next: Theme) {
+    setTheme(next)
+    saveTheme(next)
+  }
+
+  return (
+    <>
+      <Row label="Mode" hint={preset ? undefined : 'Custom colours. Pick a mode to start over from it.'}>
+        <Segmented
+          value={preset ?? ''}
+          options={PRESETS.map((p) => ({ value: p.id, label: p.label }))}
+          onChange={(id) => {
+            const p = PRESETS.find((x) => x.id === id)
+            if (p) update(p.theme)
+          }}
+        />
+      </Row>
+      <Row label="Accent colour" hint="Buttons, highlights, and selected items.">
+        <ColorField value={theme.accent} onChange={(accent) => update({ ...theme, accent })} />
+      </Row>
+      <Row
+        label="Background colour"
+        hint={
+          adjusted
+            ? `Shown as ${shownBg} so text stays readable. Cards and boxes are shaded from it.`
+            : 'The page colour. Cards, boxes, and borders are shaded from it.'
+        }
+      >
+        <ColorField value={theme.background} onChange={(background) => update({ ...theme, background })} />
+      </Row>
+      <Row label="Text colour">
+        <Segmented
+          value={theme.text}
+          options={[
+            { value: 'light', label: 'White' },
+            { value: 'dark', label: 'Black' },
+          ]}
+          onChange={(text) => update({ ...theme, text: text as TextTone })}
+        />
+      </Row>
+      {!preset && (
+        <Row label="Reset">
+          <button onClick={() => update(NIGHT)} className="btn-secondary !py-1.5 !text-xs">
+            Back to Night
+          </button>
+        </Row>
+      )}
+    </>
+  )
+}
+
+function Segmented({
+  value,
+  options,
+  onChange,
+}: {
+  value: string
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string) => void
+}) {
+  return (
+    <div className="inline-flex rounded-lg border border-ink-700 bg-ink-800 p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          onClick={() => onChange(o.value)}
+          className={`rounded-md px-3 py-1 text-xs font-medium transition ${
+            value === o.value ? 'bg-accent-600 text-on-accent' : 'text-ink-300 hover:text-ink-100'
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function ColorField({ value, onChange }: { value: string; onChange: (hex: string) => void }) {
+  const [draft, setDraft] = useState(value)
+  useEffect(() => setDraft(value), [value])
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        type="color"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 w-10 cursor-pointer rounded-md border border-ink-700 bg-ink-800 p-0.5"
+        aria-label="Pick colour"
+      />
+      <input
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value)
+          const v = e.target.value.trim()
+          const hex = v.startsWith('#') ? v : `#${v}`
+          if (parseHex(hex)) onChange(hex.toLowerCase())
+        }}
+        onBlur={() => setDraft(value)}
+        className="input-mono w-24 !py-1.5 !text-xs"
+        spellCheck={false}
+        maxLength={7}
+      />
     </div>
   )
 }

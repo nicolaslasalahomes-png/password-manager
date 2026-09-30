@@ -9,6 +9,10 @@ import { AuthProvider } from './state/AuthContext'
 import { VaultProvider } from './state/VaultContext'
 import { ToastProvider } from './state/ToastContext'
 import { is2faPopoverSync, isQuickAddWindowSync } from './lib/desktop'
+import { initTheme } from './lib/theme'
+
+// Before the first render so there's no flash of the default colours.
+initTheme()
 
 const root = createRoot(document.getElementById('root')!)
 

@@ -177,7 +177,7 @@ export default function Sidebar() {
   function badgeFor(item: NavItem, active: boolean): React.ReactNode {
     if (item.matchesPathOnly === '/vault/inbox' && unreadEmails > 0 && !active) {
       return (
-        <span className="rounded-full bg-accent-500 px-1.5 py-0.5 text-[10px] font-semibold text-white tabular-nums">
+        <span className="rounded-full bg-accent-500 px-1.5 py-0.5 text-[10px] font-semibold text-on-accent tabular-nums">
           {unreadEmails > 99 ? '99+' : unreadEmails}
         </span>
       )
@@ -252,7 +252,7 @@ export default function Sidebar() {
               <Icon size={12} />
               {item.label}
               {showInboxBadge ? (
-                <span className="ml-0.5 rounded-full bg-accent-500 px-1 py-0.5 text-[9px] font-semibold text-white">
+                <span className="ml-0.5 rounded-full bg-accent-500 px-1 py-0.5 text-[9px] font-semibold text-on-accent">
                   {unreadEmails > 99 ? '99+' : unreadEmails}
                 </span>
               ) : showNotifBadge ? (
