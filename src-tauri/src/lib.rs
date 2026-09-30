@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod browser;
+mod image_fetch;
 mod oauth;
 
 #[cfg(target_os = "macos")]
@@ -545,7 +546,8 @@ pub fn run() {
             biometric_exists,
             biometric_delete,
             oauth::start_google_oauth,
-            browser::open_url
+            browser::open_url,
+            image_fetch::fetch_image
         ])
         .on_window_event(|window, event| {
             // Close button hides the window (like macOS apps), doesn't quit.

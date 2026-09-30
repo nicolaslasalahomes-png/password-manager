@@ -5,6 +5,8 @@ import {
   ChevronLeft,
   Cog,
   ExternalLink,
+  Image as ImageIcon,
+  Loader2,
   Mail,
   RefreshCcw,
   Search,
@@ -40,10 +42,20 @@ import {
 } from '../lib/google/tokens'
 import {
   archive as gmailArchive,
+  base64UrlToBase64,
+  collectInlineImages,
+  getAttachment,
   getMessage,
   parseMessage,
   trash as gmailTrash,
 } from '../lib/google/gmail'
+import {
+  buildEmailDocument,
+  fetchRemoteImages,
+  hasRemoteContent,
+  listRemoteImageUrls,
+  newNonce,
+} from '../lib/emailImages'
 import { detectTwoFactor } from '../lib/google/twoFactor'
 
 type FilterKey = 'all' | 'unread' | '2fa' | 'today' | 'week'
@@ -102,6 +114,7 @@ function InboxDesktop() {
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
   const [decryptedById, setDecryptedById] = useState<Record<string, DecryptedCachedMessage>>({})
   const [refreshing, setRefreshing] = useState(false)
+  const cidCacheRef = useRef<Record<string, Record<string, string>>>({})
 
   const reload = useCallback(async () => {
     try {
@@ -363,6 +376,39 @@ function InboxDesktop() {
     }
   }
 
+  /**
+   * Resolve the `cid:` inline images of one email to data: URLs. Cached
+   * payloads only keep the HTML, so this re-reads the message from Gmail and
+   * pulls each image part (inline body or attachments.get). Memoised per row.
+   */
+  const loadCidImages = useCallback(
+    async (row: CachedMessageRow): Promise<Record<string, string>> => {
+      const cached = cidCacheRef.current[row.id]
+      if (cached) return cached
+      if (!dek || !accounts) return {}
+      const account = accounts.find((a) => a.id === row.account_id)
+      if (!account) return {}
+      const accessToken = await getAccessToken(account, dek)
+      const full = await getMessage(accessToken, row.gmail_message_id)
+      const out: Record<string, string> = {}
+      for (const part of collectInlineImages(full)) {
+        try {
+          const data =
+            part.data ??
+            (part.attachmentId
+              ? await getAttachment(accessToken, row.gmail_message_id, part.attachmentId)
+              : '')
+          if (data) out[part.contentId] = `data:${part.mimeType};base64,${base64UrlToBase64(data)}`
+        } catch (err) {
+          console.warn('[inbox] inline image fetch failed', part.contentId, err)
+        }
+      }
+      cidCacheRef.current[row.id] = out
+      return out
+    },
+    [dek, accounts],
+  )
+
   return (
     <Layout
       rightSlot={
@@ -539,6 +585,7 @@ function InboxDesktop() {
                 onMarkAuth={() => onMarkAuth(selectedRow)}
                 isAuthSender={authSenders.has(senderEmail(selectedRow.sender))}
                 onClose={() => setSelectedRowId(null)}
+                loadCidImages={() => loadCidImages(selectedRow)}
               />
             ) : (
               <div className="flex h-full flex-col items-center justify-center gap-2 text-ink-500">
@@ -610,6 +657,7 @@ function PreviewPane({
   onMarkAuth,
   isAuthSender,
   onClose,
+  loadCidImages,
 }: {
   row: CachedMessageRow
   message: DecryptedCachedMessage
@@ -620,6 +668,7 @@ function PreviewPane({
   onMarkAuth: () => void
   isAuthSender: boolean
   onClose: () => void
+  loadCidImages: () => Promise<Record<string, string>>
 }) {
   return (
     <>
@@ -679,7 +728,11 @@ function PreviewPane({
       </header>
       <div className="flex-1 overflow-y-auto bg-white">
         {message.bodyHtml && message.bodyHtml.trim().length > 0 ? (
-          <HtmlEmailRenderer html={message.bodyHtml} />
+          <HtmlEmailRenderer
+            key={row.id}
+            html={message.bodyHtml}
+            loadCidImages={loadCidImages}
+          />
         ) : (
           <pre className="whitespace-pre-wrap p-5 font-sans text-sm text-ink-950">
             {message.bodyText}
@@ -690,58 +743,60 @@ function PreviewPane({
   )
 }
 
-function HtmlEmailRenderer({ html }: { html: string }) {
+function HtmlEmailRenderer({
+  html,
+  loadCidImages,
+}: {
+  html: string
+  loadCidImages: () => Promise<Record<string, string>>
+}) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null)
   const [height, setHeight] = useState<number>(400)
+  const [cidImages, setCidImages] = useState<Record<string, string>>({})
+  const [remoteImages, setRemoteImages] = useState<Record<string, string>>({})
+  const [allowRemote, setAllowRemote] = useState(false)
+  const [loadingImages, setLoadingImages] = useState(false)
+  const nonce = useMemo(() => newNonce(), [])
+  const remoteBlocked = useMemo(() => hasRemoteContent(html), [html])
 
-  const srcDoc = useMemo(() => {
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<base target="_blank">
-<style>
-  html, body { margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 16px; color: #1f2937; background: #ffffff; word-wrap: break-word; }
-  img { max-width: 100%; height: auto; }
-  table { max-width: 100% !important; }
-  a { color: #2563eb; }
-</style>
-</head>
-<body>
-${html}
-<script>
-  document.addEventListener('click', function(e) {
-    var a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if (a && a.href) {
-      e.preventDefault();
-      e.stopPropagation();
-      try { parent.postMessage({ type: 'keyring:open-url', url: a.href }, '*'); } catch (err) {}
+  // Inline (cid:) images are part of the email itself, not tracking, so they
+  // load straight away, same as the console viewer.
+  useEffect(() => {
+    if (!/src\s*=\s*["']?cid:/i.test(html)) return
+    let cancelled = false
+    loadCidImages()
+      .then((map) => {
+        if (!cancelled) setCidImages(map)
+      })
+      .catch((err) => console.warn('[inbox] inline images failed', err))
+    return () => {
+      cancelled = true
     }
-  }, true);
-  function reportHeight() {
-    var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-    try { parent.postMessage({ type: 'keyring:height', height: h }, '*'); } catch (err) {}
+  }, [html, loadCidImages])
+
+  async function onLoadImages() {
+    setLoadingImages(true)
+    try {
+      setRemoteImages(await fetchRemoteImages(listRemoteImageUrls(html)))
+    } finally {
+      setAllowRemote(true)
+      setLoadingImages(false)
+    }
   }
-  window.addEventListener('load', reportHeight);
-  setTimeout(reportHeight, 50);
-  setTimeout(reportHeight, 300);
-  setTimeout(reportHeight, 1000);
-  document.querySelectorAll('img').forEach(function(img) {
-    img.addEventListener('load', reportHeight);
-    img.addEventListener('error', reportHeight);
-  });
-</script>
-</body>
-</html>`
-  }, [html])
+
+  const srcDoc = useMemo(
+    () => buildEmailDocument(html, { cidImages, remoteImages, allowRemote, nonce }),
+    [html, cidImages, remoteImages, allowRemote, nonce],
+  )
 
   useEffect(() => {
     function onMessage(e: MessageEvent) {
+      // Only trust messages from this email's own frame.
+      if (e.source !== iframeRef.current?.contentWindow) return
       const data = e.data as { type?: string; url?: string; height?: number } | null
       if (!data || typeof data !== 'object') return
       if (data.type === 'keyring:open-url' && data.url) {
-        void openExternalUrl(data.url)
+        if (/^(https?:|mailto:|tel:)/i.test(data.url)) void openExternalUrl(data.url)
       } else if (data.type === 'keyring:height' && typeof data.height === 'number') {
         setHeight(Math.min(Math.max(data.height + 32, 200), 6000))
       }
@@ -751,13 +806,32 @@ ${html}
   }, [])
 
   return (
-    <iframe
-      ref={iframeRef}
-      srcDoc={srcDoc}
-      sandbox="allow-scripts allow-popups"
-      style={{ width: '100%', height: `${height}px`, border: 'none', background: 'white' }}
-      title="Email body"
-    />
+    <>
+      {remoteBlocked && !allowRemote && (
+        <div className="flex items-center justify-between gap-3 border-b border-ink-800 bg-ink-900 px-4 py-2 text-xs text-ink-300">
+          <span>Images are hidden to stop senders tracking when you open this email.</span>
+          <button
+            onClick={() => void onLoadImages()}
+            className="btn-ghost !px-2 !py-1 text-xs"
+            disabled={loadingImages}
+          >
+            {loadingImages ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <ImageIcon size={13} />
+            )}
+            {loadingImages ? 'Loading images' : 'Load images'}
+          </button>
+        </div>
+      )}
+      <iframe
+        ref={iframeRef}
+        srcDoc={srcDoc}
+        sandbox="allow-scripts"
+        style={{ width: '100%', height: `${height}px`, border: 'none', background: 'white' }}
+        title="Email body"
+      />
+    </>
   )
 }
 

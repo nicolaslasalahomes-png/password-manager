@@ -183,6 +183,17 @@ export async function trash(accessToken: string, id: string): Promise<void> {
   await gfetch(accessToken, `/messages/${id}/trash`, { method: 'POST' })
 }
 
+/** Fetch one attachment body. Returns Gmail's base64url `data`. */
+export async function getAttachment(
+  accessToken: string,
+  messageId: string,
+  attachmentId: string,
+): Promise<string> {
+  const resp = await gfetch(accessToken, `/messages/${messageId}/attachments/${attachmentId}`)
+  const json = (await resp.json()) as { data?: string }
+  return json.data ?? ''
+}
+
 // ── Parsing ────────────────────────────────────────────────────────────────
 
 function headerValue(headers: GmailHeader[] | undefined, name: string): string {
@@ -297,4 +308,39 @@ export function parseMessage(msg: GmailMessage): ParsedMessage {
     receivedAt,
     labelIds: msg.labelIds ?? [],
   }
+}
+
+/** An inline image referenced from the HTML body as `cid:<contentId>`. */
+export interface InlineImagePart {
+  contentId: string
+  mimeType: string
+  /** base64url body when Gmail inlined it in the message payload. */
+  data?: string
+  /** Set when the body has to be fetched with getAttachment. */
+  attachmentId?: string
+}
+
+/** Every image part that carries a Content-ID, for resolving `cid:` URLs. */
+export function collectInlineImages(msg: GmailMessage): InlineImagePart[] {
+  const out: InlineImagePart[] = []
+  const visit = (p: GmailPart) => {
+    const cidHeader = headerValue(p.headers, 'Content-ID') || headerValue(p.headers, 'X-Attachment-Id')
+    const mimeType = (p.mimeType ?? '').toLowerCase()
+    if (cidHeader && mimeType.startsWith('image/') && (p.body?.data || p.body?.attachmentId)) {
+      out.push({
+        contentId: cidHeader.trim().replace(/^<|>$/g, ''),
+        mimeType,
+        data: p.body?.data,
+        attachmentId: p.body?.attachmentId,
+      })
+    }
+    for (const child of p.parts ?? []) visit(child)
+  }
+  if (msg.payload) visit(msg.payload)
+  return out
+}
+
+/** Gmail base64url → standard base64 (for data: URLs). */
+export function base64UrlToBase64(s: string): string {
+  return s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "keyring-desktop"
-version = "0.5.6"
+version = "0.5.7"
 description = "Keyring — personal encrypted vault"
 authors = ["Nicolas Sutcliffe"]
 license = ""
@@ -42,6 +42,9 @@ version = "0.22"
 version = "0.10"
 
 [dependencies.url]
+version = "2"
+
+[dependencies.ureq]
 version = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
