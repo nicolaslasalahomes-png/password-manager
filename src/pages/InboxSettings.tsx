@@ -24,6 +24,8 @@ import {
   getAuthSenders,
   getSpamSenders,
   listUnclassifiedMessages,
+  countUnclassifiedMessages,
+  getCachedPayload,
   removeAuthSender,
   removeSpamSender,
   saveAnthropicApiKey,
@@ -92,8 +94,7 @@ export default function InboxSettings() {
 
   const refreshUnclassifiedCount = useCallback(async () => {
     try {
-      const rows = await listUnclassifiedMessages(2000)
-      setUnclassifiedCount(rows.length)
+      setUnclassifiedCount(await countUnclassifiedMessages())
     } catch {
       setUnclassifiedCount(null)
     }
@@ -195,7 +196,10 @@ export default function InboxSettings() {
           const i = cursor++
           const row = rows[i]
           try {
-            const payload = await decryptCachedPayload(row, dek!)
+            // Bodies one at a time, only for rows being classified.
+            const full = await getCachedPayload(row.id)
+            if (!full) throw new Error("row no longer cached")
+            const payload = await decryptCachedPayload(full, dek!)
             const result = await classifyEmail(
               {
                 subject: payload.subject,

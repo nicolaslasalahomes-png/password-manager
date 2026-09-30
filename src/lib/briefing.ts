@@ -22,7 +22,7 @@ import { supabase } from './supabase'
 import { decryptJson, encryptJson } from './encryption'
 import { getStoreValue, setStoreValue } from './desktop'
 import { listOpenTasks } from './tasks'
-import { decryptCachedPayload, getAnthropicApiKey, listCachedMessages, senderEmail } from './email'
+import { getAnthropicApiKey, listImportantSince, resolveHeaders, senderEmail } from './email'
 import { callClaude } from './ai/anthropic'
 import { buildBriefPlan, ensureMustShow } from './briefPlan'
 import { loadNeedsYou } from './inbox/load'
@@ -148,28 +148,16 @@ export async function generateBriefing(userId: string, dek: Uint8Array): Promise
   // run; if it hasn't, this is just empty and the brief is task-only).
   let emailLines = ''
   try {
-    const msgs = await listCachedMessages({ limit: 500 })
-    const since = new Date(periodStart).getTime()
-    const important = msgs
-      .filter(
-        (m) =>
-          m.is_important === true &&
-          !m.is_2fa_candidate && // codes are transient, never "to read"
-          senderEmail(m.sender) !== KEYRING_SENDER && // our own 2FA emails
-          new Date(m.received_at).getTime() > since,
-      )
+    // Filtered server-side and headers only: no email bodies are downloaded.
+    // 2FA codes are transient, never "to read"; our own 2FA emails are skipped.
+    const important = (await listImportantSince(new Date(periodStart).toISOString(), 30))
+      .filter((m) => senderEmail(m.sender) !== KEYRING_SENDER)
       .slice(0, 15)
-    const decoded = await Promise.all(
-      important.map(async (m) => {
-        try {
-          const p = await decryptCachedPayload(m, dek)
-          return `- ${m.sender ?? 'unknown'}: ${p.subject}`
-        } catch {
-          return null
-        }
-      }),
-    )
-    emailLines = decoded.filter(Boolean).join('\n')
+    const headers = await resolveHeaders(important, dek)
+    emailLines = important
+      .filter((m) => headers[m.id])
+      .map((m) => `- ${m.sender ?? 'unknown'}: ${headers[m.id].subject}`)
+      .join('\n')
   } catch (err) {
     console.warn('[briefing] email gather failed (non-fatal)', err)
   }
