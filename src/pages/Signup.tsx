@@ -81,9 +81,9 @@ export default function Signup() {
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="new-password"
             required
-            minLength={8}
+            minLength={12}
           />
-          <p className="mt-1.5 text-xs text-ink-400">At least 8 characters.</p>
+          <p className="mt-1.5 text-xs text-ink-400">At least 12 characters.</p>
         </div>
         <button type="submit" className="btn-primary w-full" disabled={submitting}>
           <UserPlus size={16} />
