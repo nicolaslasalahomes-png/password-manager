@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react'
 import Layout from '../components/Layout'
+import NeedsYouPanel from '../components/NeedsYouPanel'
 import DateTimePicker from '../components/DateTimePicker'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
@@ -326,6 +327,9 @@ export default function Todo() {
           )}
         </div>
       )}
+
+      {/* VAULT-1: the Needs-you list sits beside his own tasks, never instead of them. */}
+      <NeedsYouPanel className="mt-6" />
     </Layout>
   )
 }

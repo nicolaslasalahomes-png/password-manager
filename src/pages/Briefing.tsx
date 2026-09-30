@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Sparkles } from 'lucide-react'
 import Layout from '../components/Layout'
+import NeedsYouPanel from '../components/NeedsYouPanel'
 import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
 import { useIsDesktop } from '../lib/desktop'
@@ -77,6 +78,8 @@ export default function BriefingPage() {
           Claude's morning rundown of what to focus on, one entry per day. Newest first.
         </p>
       </div>
+
+      <NeedsYouPanel className="mb-4" />
 
       {briefs === null ? (
         <p className="py-12 text-center text-sm text-ink-300">Loading…</p>
