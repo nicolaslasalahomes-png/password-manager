@@ -96,7 +96,9 @@ const SECTIONS = new Set(['asap', 'instant', 'think', 'later'])
 /** Check the snapshot before sealing; the app validates again after opening. */
 export function toPayload(snap) {
   if (!Number.isInteger(snap?.list_no) || !Array.isArray(snap?.items)) throw new Error('snapshot needs list_no and items')
-  const created_at = snap.created_at && !Number.isNaN(Date.parse(snap.created_at)) ? snap.created_at : new Date().toISOString()
+  // Stamped here, at sealing, never taken from the file: the app refuses a list older than one it
+  // has shown (rollback guard), so a snapshot re-written with a stale created_at must not look older.
+  const created_at = new Date(Math.max(Date.now(), Date.parse(snap.created_at) || 0)).toISOString()
   const seen = new Set()
   const items = snap.items.map((i, n) => {
     if (!/^N\d{1,4}[a-z]?$/.test(i?.id ?? '')) throw new Error(`item ${n}: bad id ${i?.id}`)

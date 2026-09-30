@@ -154,6 +154,12 @@ describe('the vault inbox key', () => {
 })
 
 describe('writer checks the snapshot before sealing', () => {
+  it('stamps created_at at sealing, so a stale file date can never trip the rollback guard', () => {
+    const before = Date.now()
+    const p = toPayload({ list_no: 13, created_at: '2026-09-30T12:51:09Z', items: [] })
+    expect(Date.parse(p.created_at)).toBeGreaterThanOrEqual(before)
+  })
+
   it('rejects duplicate IDs, bad sections, http links and em dashes', () => {
     const base = { list_no: 1, items: [] as unknown[] }
     expect(() => toPayload({ ...base, items: [{ id: 'N1', section: 'asap', title: 'a' }, { id: 'N1', section: 'asap', title: 'b' }] })).toThrow(/twice/)
