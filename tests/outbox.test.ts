@@ -97,10 +97,14 @@ describe('the reader refuses', () => {
 })
 
 describe('small pieces', () => {
-  it('one-tap answers follow the recommendation', () => {
-    expect(quickAnswers('Recommend go')).toEqual(['Go', 'No'])
-    expect(quickAnswers('Recommend yes, it only affects interns')).toEqual(['Yes', 'No'])
-    expect(quickAnswers(undefined)).toEqual(['Yes', 'No'])
+  it('one-tap answers follow the recommendation line', () => {
+    const labels = (a: string | undefined) => quickAnswers(a).map((q) => (q.recommended ? `*${q.label}` : q.label))
+    expect(labels('Recommend go')).toEqual(['*Go', 'No'])
+    expect(labels('What is going on.\nRecommend: go')).toEqual(['*Go', 'No'])
+    expect(labels('Recommend: yes, it only affects interns')).toEqual(['*Yes', 'No'])
+    expect(labels('Recommend: no')).toEqual(['Yes', '*No'])
+    expect(labels('Two ways.\n(a) keep her logo wall shot\n(b) ask for a new one\n(c) leave it\nRecommend: (b)')).toEqual(['(a)', '*(b)', '(c)'])
+    expect(labels(undefined)).toEqual(['Yes', 'No'])
   })
 
   it('the reader never writes a row twice', () => {

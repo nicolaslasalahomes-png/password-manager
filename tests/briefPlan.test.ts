@@ -113,3 +113,18 @@ describe('ensureMustShow', () => {
     expect(ensureMustShow('• N20: something', p)).toContain('• N2 (Do ASAP): x')
   })
 })
+
+describe('VAULT-2b: long explanations', () => {
+  it('the brief carries the title and the recommendation line, not the whole explanation', () => {
+    const action = 'Line one about what is going on.\nLine two about the options.\n(a) this (b) that\nRecommend: (b)'
+    const p = buildBriefPlan({
+      tasks: [],
+      needs: { ...needs, items: [{ id: 'N40', section: 'instant', title: 'Pick a photo', action }] },
+      now,
+      fmtDue,
+      fmtDay,
+    })
+    expect(p.lines[0].text).toBe('[N40 · Instant decision] Pick a photo (Recommend: (b))')
+    expect(p.lines[0].text).not.toContain('Line one')
+  })
+})

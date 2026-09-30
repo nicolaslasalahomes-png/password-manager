@@ -116,8 +116,8 @@ export default function NeedsYouPanel({ className = '' }: { className?: string }
             </button>
             {showRest && (
               <div className="mt-2 space-y-3">
-                <Section label={SECTION_LABEL.think} items={now('think')} sent={sent} onReply={reply} />
-                <Section label={SECTION_LABEL.later} items={now('later')} sent={sent} onReply={reply} />
+                <Section label={SECTION_LABEL.think} items={now('think')} sent={sent} onReply={reply} explainCollapsed />
+                <Section label={SECTION_LABEL.later} items={now('later')} sent={sent} onReply={reply} explainCollapsed />
               </div>
             )}
           </div>
@@ -134,12 +134,15 @@ function Section({
   sent,
   onReply,
   quick = false,
+  explainCollapsed = false,
 }: {
   label: string
   items: NeedsYouItem[]
   sent: Record<string, SentReply>
   onReply: (item: NeedsYouItem, text: string) => Promise<boolean>
   quick?: boolean
+  /** Think about / Later: the explanation sits behind "What's this?" so the card stays scannable. */
+  explainCollapsed?: boolean
 }) {
   if (!items.length) return null
   const today = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).getTime()
@@ -157,7 +160,7 @@ function Section({
               </span>
               <div className="min-w-0 flex-1">
                 <p className="text-ink-100">{i.title}</p>
-                {i.action && <p className="text-xs text-ink-400">{i.action}</p>}
+                {i.action && <Explanation text={i.action} collapsed={explainCollapsed} />}
                 {day && (
                   <p className={`text-xs ${overdue ? 'text-red-300' : 'text-ink-400'}`}>
                     {overdue ? 'Overdue, was due ' : 'Due '}
@@ -180,6 +183,42 @@ function Section({
           )
         })}
       </ul>
+    </div>
+  )
+}
+
+/**
+ * VAULT-2b (Nicolas, 30 Sep 2026): "I need to be explained whats actually going on, otherwise its
+ * impossible for me to answer". The explanation is a few short lines, shown at reading size with
+ * its line breaks kept. ink-200 on the card (ink-900) measures 12.4:1 in Night and 11.5:1 in Day.
+ */
+function Explanation({ text, collapsed }: { text: string; collapsed: boolean }) {
+  const [open, setOpen] = useState(!collapsed)
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="mt-0.5 flex items-center gap-1 text-xs font-medium text-accent-400 hover:underline"
+      >
+        <ChevronRight size={12} /> What&apos;s this?
+      </button>
+    )
+  }
+  return (
+    <div className="mt-1">
+      <p className="whitespace-pre-line text-sm leading-relaxed text-ink-200" data-testid="needs-you-explanation">
+        {text}
+      </p>
+      {collapsed && (
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          className="mt-0.5 flex items-center gap-1 text-xs font-medium text-ink-300 hover:underline"
+        >
+          <ChevronDown size={12} /> Hide
+        </button>
+      )}
     </div>
   )
 }
@@ -218,13 +257,14 @@ function ReplyBox({
         {quick &&
           quickAnswers(item.action).map((a) => (
             <button
-              key={a}
+              key={a.label}
               type="button"
               disabled={busy}
-              onClick={() => void send(a)}
-              className="btn-ghost !px-2 !py-0.5 text-xs"
+              onClick={() => void send(a.label)}
+              className={`${a.recommended ? 'btn-primary' : 'btn-ghost'} !px-2 !py-0.5 text-xs`}
+              title={a.recommended ? 'Recommended' : undefined}
             >
-              {a}
+              {a.label}
             </button>
           ))}
         <input

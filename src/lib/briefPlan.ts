@@ -13,6 +13,7 @@
  */
 import type { Priority } from './items'
 import { SECTION_LABEL, dueDayStart, type NeedsYouSnapshot } from './inbox/needsYou'
+import { recommendationLine } from './inbox/reply'
 
 export interface OwnTask {
   title: string
@@ -97,7 +98,9 @@ export function buildBriefPlan(args: {
       return
     }
     const when = n.due ? ` [due ${fmtDay(dueDayStart(n.due))}${overdue ? ' (OVERDUE)' : ''}]` : ''
-    const what = `${n.title}${n.action ? `: ${n.action}` : ''}`
+    // The card shows the full explanation; the brief has room for the title and the recommendation.
+    const rec = recommendationLine(n.action)
+    const what = `${n.title}${rec ? ` (${rec})` : ''}`
     rows.push({
       source: 'needs',
       tier,

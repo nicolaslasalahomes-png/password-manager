@@ -88,9 +88,33 @@ export async function sealReply(p: ReplyPayload, readerPublicJwk: JsonWebKey): P
   return { v: 1, ...head, ct: b64(ct) }
 }
 
-/** The one-tap answers for an Instant item: its recommendation ("Go" or "Yes") and "No". */
-export function quickAnswers(action: string | undefined): string[] {
-  const m = /recommend(?:ed|s)?[:\s]+(go|yes)\b/i.exec(action ?? '')
-  const yes = m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() : 'Yes'
-  return [yes, 'No']
+export interface QuickAnswer {
+  label: string
+  recommended: boolean
+}
+
+/**
+ * The one-tap answers for an Instant item, from its explanation's last line:
+ *   "Recommend: go" / "Recommend: yes"  -> Go (or Yes), No
+ *   "Recommend: no"                     -> Yes, No (No marked)
+ *   "Recommend: (b)"                    -> one button per option named "(a)", "(b)"... in the text
+ * Anything else gets Yes and No. The recommended answer is marked, never pre-sent.
+ */
+export function quickAnswers(action: string | undefined): QuickAnswer[] {
+  const text = action ?? ''
+  const m = /recommend(?:ed|s)?\s*[:\-]?\s*(\([a-e]\)|go\b|yes\b|no\b)/i.exec(text)
+  const pick = m ? m[1].toLowerCase() : null
+  if (pick && pick.startsWith('(')) {
+    const opts = [...new Set([...text.matchAll(/\(([a-e])\)/gi)].map((x) => `(${x[1].toLowerCase()})`))]
+    if (opts.length >= 2) return opts.map((o) => ({ label: o, recommended: o === pick }))
+  }
+  if (pick === 'go') return [{ label: 'Go', recommended: true }, { label: 'No', recommended: false }]
+  if (pick === 'no') return [{ label: 'Yes', recommended: false }, { label: 'No', recommended: true }]
+  return [{ label: 'Yes', recommended: pick === 'yes' }, { label: 'No', recommended: false }]
+}
+
+/** The "Recommend: ..." line of an explanation, for places with room for one line (the brief). */
+export function recommendationLine(action: string | undefined): string | null {
+  const line = (action ?? '').split('\n').map((l) => l.trim()).reverse().find((l) => /^recommend/i.test(l))
+  return line ? line.slice(0, 200) : null
 }

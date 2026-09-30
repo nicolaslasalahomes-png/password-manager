@@ -168,3 +168,20 @@ describe('writer checks the snapshot before sealing', () => {
     expect(() => toPayload({ ...base, items: [{ id: 'N1', section: 'asap', title: 'a \u2014 b' }] })).toThrow(/em dash/)
   })
 })
+
+describe('VAULT-2b: explanations survive the trip', () => {
+  it('keeps 700-char, multi-line actions whole', async () => {
+    const action = ('What is going on, in plain words. '.repeat(20) + '\nRecommend: go').slice(-700)
+    const items = Array.from({ length: 15 }, (_, i) => ({ id: `N${40 + i}`, section: 'instant', title: `Item ${i}`, action }))
+    const payload = toPayload({ list_no: 20, items })
+    const { envelope, json } = await open(await sealIt(payload))
+    const snap = toSnapshot(json, envelope)
+    expect(snap.items).toHaveLength(15)
+    expect(snap.items[0].action).toBe(action.trim())
+    expect(snap.items[0].action).toContain('\nRecommend: go')
+  })
+
+  it('the writer refuses an explanation over 1500 chars instead of cutting it', () => {
+    expect(() => toPayload({ list_no: 1, items: [{ id: 'N1', section: 'asap', title: 't', action: 'x'.repeat(1501) }] })).toThrow(/under 1500/)
+  })
+})

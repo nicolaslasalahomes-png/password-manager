@@ -36,6 +36,8 @@ export const SECTION_LABEL: Record<NeedsYouSection, string> = {
   think: 'Think about',
   later: 'Later',
 }
+/** An item's plain explanation: a few short lines (what is going on, the options, the recommendation). */
+export const MAX_ACTION_CHARS = 1500
 const SECTIONS = new Set<NeedsYouSection>(['asap', 'instant', 'think', 'later'])
 /** Snapshots older than this are shown with their date, as possibly out of date. */
 export const STALE_AFTER_MS = 36 * 60 * 60 * 1000
@@ -64,7 +66,7 @@ export function toSnapshot(json: unknown, header: { created_at: string; list_no:
       id,
       section: r.section as NeedsYouSection,
       title,
-      action: cap(r.action, 500),
+      action: cap(r.action, MAX_ACTION_CHARS),
       link: link && /^https:\/\/[^\s]+$/.test(link) ? link : undefined,
       due: due && !Number.isNaN(Date.parse(due)) ? due : undefined,
     })

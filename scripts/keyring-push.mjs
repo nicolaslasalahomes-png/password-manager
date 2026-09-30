@@ -108,7 +108,11 @@ export function toPayload(snap) {
     if (typeof i.title !== 'string' || !i.title.trim()) throw new Error(`${i.id}: title required`)
     if (/\u2014/.test(JSON.stringify(i))) throw new Error(`${i.id}: no em dashes`)
     const out = { id: i.id, section: i.section, title: i.title.trim() }
-    if (i.action) out.action = String(i.action).trim()
+    if (i.action) {
+      out.action = String(i.action).trim()
+      if (out.action.length > 1500) throw new Error(`${i.id}: action is ${out.action.length} chars; keep it under 1500`)
+    }
+    if (out.title.length > 300) throw new Error(`${i.id}: title is ${out.title.length} chars; keep it under 300`)
     if (i.link) {
       if (!/^https:\/\/\S+$/.test(i.link)) throw new Error(`${i.id}: link must be https`)
       out.link = i.link
