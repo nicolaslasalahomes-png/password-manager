@@ -21,17 +21,21 @@ import { useVault } from '../state/VaultContext'
 import { useToast } from '../state/ToastContext'
 import { openExternalUrl, useIsDesktop } from '../lib/desktop'
 import {
-  type CachedMessageRow,
+  type CachedMessageHeader,
+  type CachedMessageMeta,
   type DecryptedCachedMessage,
   addAuthSender,
   addSpamSender,
   decryptCachedPayload,
+  getCachedPayload,
   deleteCachedMessage,
   getAiInboxEnabled,
   getAuthSenders,
   getSpamSenders,
   listCachedMessages,
   markInboxSeen,
+  resolveHeaders,
+  ServerStrainError,
   senderEmail,
   upsertCachedMessage,
 } from '../lib/email'
@@ -96,6 +100,23 @@ function InboxWebFallback() {
   )
 }
 
+/**
+ * Survives leaving and re-entering the Inbox tab, so a re-open paints the
+ * last list instantly and only refreshes in the background. Tied to the DEK
+ * object: locking the vault (new DEK or none) throws it away.
+ */
+let sessionCache: {
+  dek: Uint8Array
+  rows: CachedMessageMeta[]
+  headers: Record<string, CachedMessageHeader>
+  headerIv: Record<string, string | null>
+} | null = null
+
+type MessageBody = { bodyText: string; bodyHtml: string }
+
+/** Rows rendered at first; more are added as the list is scrolled. */
+const LIST_CHUNK = 150
+
 function InboxDesktop() {
   const { dek } = useVault()
   const toast = useToast()
@@ -104,7 +125,8 @@ function InboxDesktop() {
   const mode: 'main' | 'all' = location.pathname.endsWith('/all') ? 'all' : 'main'
 
   const [accounts, setAccounts] = useState<EmailAccountRow[] | null>(null)
-  const [rows, setRows] = useState<CachedMessageRow[] | null>(null)
+  const cached = sessionCache && sessionCache.dek === dek ? sessionCache : null
+  const [rows, setRows] = useState<CachedMessageMeta[] | null>(cached?.rows ?? null)
   const [spamSenders, setSpamSenders] = useState<Set<string>>(new Set())
   const [authSenders, setAuthSenders] = useState<Set<string>>(new Set())
   const [aiEnabled, setAiEnabled] = useState(false)
@@ -112,7 +134,13 @@ function InboxDesktop() {
   const [activeFilter, setActiveFilter] = useState<FilterKey>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
-  const [decryptedById, setDecryptedById] = useState<Record<string, DecryptedCachedMessage>>({})
+  const [headersById, setHeadersById] = useState<Record<string, CachedMessageHeader>>(
+    cached?.headers ?? {},
+  )
+  const headerIvRef = useRef<Record<string, string | null>>(cached?.headerIv ?? {})
+  const [bodiesById, setBodiesById] = useState<Record<string, MessageBody>>({})
+  const [loadingBodyId, setLoadingBodyId] = useState<string | null>(null)
+  const [visibleCount, setVisibleCount] = useState(LIST_CHUNK)
   const [refreshing, setRefreshing] = useState(false)
   const cidCacheRef = useRef<Record<string, Record<string, string>>>({})
 
@@ -120,7 +148,9 @@ function InboxDesktop() {
     try {
       const [accs, msgs, spams, auths, ai] = await Promise.all([
         listAccounts(),
-        listCachedMessages({ limit: 2000 }),
+        // Metadata + small encrypted headers only, paged; the first page
+        // paints as soon as it lands. Bodies load when a message is opened.
+        listCachedMessages({ limit: 5000, onPage: (soFar) => setRows(soFar) }),
         getSpamSenders(),
         getAuthSenders(),
         getAiInboxEnabled(),
@@ -152,35 +182,58 @@ function InboxDesktop() {
     }
   }, [])
 
-  // Stream decryption in batches of 50 so 2000-email inboxes don't freeze UI.
+  // Decrypt headers for rows we don't have yet (or whose header changed).
+  // Stored headers are ~300 B each, so this is quick; legacy rows without a
+  // header get one derived from their body, 10 per request, and saved back.
   useEffect(() => {
     if (!rows || !dek) return
     let cancelled = false
     ;(async () => {
-      const BATCH = 50
-      const local: Record<string, DecryptedCachedMessage> = { ...decryptedById }
-      const todo = rows.filter((r) => !local[r.id])
-      for (let i = 0; i < todo.length; i += BATCH) {
+      const todo = rows.filter(
+        (r) => !(r.id in headerIvRef.current) || headerIvRef.current[r.id] !== r.iv_header,
+      )
+      const withHeader = todo.filter((r) => r.encrypted_header)
+      const legacy = todo.filter((r) => !r.encrypted_header)
+      const BATCH = 200
+      for (let i = 0; i < withHeader.length; i += BATCH) {
         if (cancelled) return
-        const slice = todo.slice(i, i + BATCH)
-        await Promise.all(
-          slice.map(async (r) => {
-            try {
-              local[r.id] = await decryptCachedPayload(r, dek)
-            } catch (err) {
-              console.warn('[inbox] decrypt failed for', r.id, err)
-            }
-          }),
-        )
-        if (!cancelled) setDecryptedById({ ...local })
-        await new Promise((r) => setTimeout(r, 0))
+        const slice = withHeader.slice(i, i + BATCH)
+        const got = await resolveHeaders(slice, dek)
+        if (cancelled) return
+        for (const r of slice) headerIvRef.current[r.id] = r.iv_header
+        setHeadersById((prev) => ({ ...prev, ...got }))
+      }
+      // Resumable by design: finished rows have a header in the DB, so the
+      // next inbox open only picks up what's left.
+      for (let i = 0; i < legacy.length; i += 10) {
+        if (cancelled) return
+        const slice = legacy.slice(i, i + 10)
+        try {
+          const got = await resolveHeaders(slice, dek)
+          if (cancelled) return
+          for (const r of slice) headerIvRef.current[r.id] = r.iv_header
+          setHeadersById((prev) => ({ ...prev, ...got }))
+          console.info(`[inbox] header backfill ${Math.min(i + 10, legacy.length)}/${legacy.length}`)
+        } catch (err) {
+          if (err instanceof ServerStrainError) {
+            console.warn('[inbox] header backfill stopped: database returned', err.status)
+            return
+          }
+          console.warn('[inbox] legacy header batch failed', err)
+        }
+        await new Promise((r) => setTimeout(r, 250))
       }
     })()
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, dek])
+
+  // Keep the session cache current so the next visit paints instantly.
+  useEffect(() => {
+    if (!dek || !rows) return
+    sessionCache = { dek, rows, headers: headersById, headerIv: headerIvRef.current }
+  }, [dek, rows, headersById])
 
   const authSendersList = useMemo(() => Array.from(authSenders), [authSenders])
 
@@ -188,21 +241,25 @@ function InboxDesktop() {
     const out: Record<string, boolean> = {}
     if (!rows) return out
     for (const r of rows) {
-      const dec = decryptedById[r.id]
-      if (!dec) continue
       // A manually-marked auth sender always counts, even if no code/link is
       // extractable from the cached payload.
       if (senderEmail(r.sender) && authSenders.has(senderEmail(r.sender))) {
         out[r.id] = true
         continue
       }
+      // Flagged from the full body when the email was first cached.
+      if (r.is_2fa_candidate) {
+        out[r.id] = true
+        continue
+      }
+      const dec = headersById[r.id]
+      if (!dec) continue
       const match = detectTwoFactor(
         {
           subject: dec.subject,
           from: r.sender ?? '',
           snippet: dec.snippet,
-          bodyText: dec.bodyText,
-          bodyHtml: dec.bodyHtml,
+          bodyText: '',
           labelIds: dec.labelIds,
         },
         { authSenders: authSendersList },
@@ -210,7 +267,7 @@ function InboxDesktop() {
       out[r.id] = !!match && match.confidence >= 0.6
     }
     return out
-  }, [rows, decryptedById, authSenders, authSendersList])
+  }, [rows, headersById, authSenders, authSendersList])
 
   const filteredRows = useMemo(() => {
     if (!rows) return []
@@ -218,7 +275,7 @@ function InboxDesktop() {
     const dayMs = 24 * 60 * 60 * 1000
     const q = searchQuery.trim().toLowerCase()
     return rows.filter((r) => {
-      const dec = decryptedById[r.id]
+      const dec = headersById[r.id]
 
       // Main inbox filter. AI mode takes precedence when enabled — it's
       // strictly more accurate than heuristics. Heuristic fallback runs when
@@ -258,15 +315,34 @@ function InboxDesktop() {
           ' ' +
           (dec?.snippet ?? '').toLowerCase() +
           ' ' +
-          (dec?.bodyText ?? '').toLowerCase()
+          (bodiesById[r.id]?.bodyText ?? '').toLowerCase()
         if (!hay.includes(q)) return false
       }
       return true
     })
-  }, [rows, decryptedById, selectedAccountIds, activeFilter, searchQuery, liveIs2fa, mode, spamSenders, aiEnabled])
+  }, [rows, headersById, bodiesById, selectedAccountIds, activeFilter, searchQuery, liveIs2fa, mode, spamSenders, aiEnabled])
+
+  useEffect(() => setVisibleCount(LIST_CHUNK), [selectedAccountIds, activeFilter, searchQuery, mode])
 
   const selectedRow = selectedRowId ? rows?.find((r) => r.id === selectedRowId) ?? null : null
-  const selectedDecrypted = selectedRowId ? decryptedById[selectedRowId] ?? null : null
+  const selectedHeader = selectedRowId ? headersById[selectedRowId] ?? null : null
+  const selectedBody = selectedRowId ? bodiesById[selectedRowId] ?? null : null
+  const selectedDecrypted: DecryptedCachedMessage | null =
+    selectedRow && selectedHeader
+      ? {
+          ...selectedHeader,
+          bodyText: selectedBody?.bodyText ?? '',
+          bodyHtml: selectedBody?.bodyHtml ?? '',
+          id: selectedRow.id,
+          account_id: selectedRow.account_id,
+          gmail_message_id: selectedRow.gmail_message_id,
+          thread_id: selectedRow.thread_id,
+          received_at: selectedRow.received_at,
+          sender: selectedRow.sender,
+          is_2fa_candidate: selectedRow.is_2fa_candidate,
+          popped_at: selectedRow.popped_at,
+        }
+      : null
 
   function toggleAccount(id: string) {
     setSelectedAccountIds((prev) => {
@@ -277,7 +353,7 @@ function InboxDesktop() {
     })
   }
 
-  async function onArchive(row: CachedMessageRow) {
+  async function onArchive(row: CachedMessageMeta) {
     if (!dek) return
     const account = accounts?.find((a) => a.id === row.account_id)
     if (!account) return
@@ -294,7 +370,7 @@ function InboxDesktop() {
     }
   }
 
-  async function onTrash(row: CachedMessageRow) {
+  async function onTrash(row: CachedMessageMeta) {
     if (!dek) return
     if (!confirm('Move this email to Trash?')) return
     const account = accounts?.find((a) => a.id === row.account_id)
@@ -312,7 +388,7 @@ function InboxDesktop() {
     }
   }
 
-  async function onMarkSpam(row: CachedMessageRow) {
+  async function onMarkSpam(row: CachedMessageMeta) {
     const addr = senderEmail(row.sender)
     if (!addr) return
     if (!confirm(`Mark ${addr} as spam? Future emails from this sender will be hidden from your main Inbox (still visible in All emails).`)) return
@@ -327,7 +403,7 @@ function InboxDesktop() {
     }
   }
 
-  async function onMarkAuth(row: CachedMessageRow) {
+  async function onMarkAuth(row: CachedMessageMeta) {
     const addr = senderEmail(row.sender)
     if (!addr) return
     try {
@@ -343,18 +419,26 @@ function InboxDesktop() {
    * Open an email: select it (preview pane swaps) AND if the cached payload
    * doesn't have HTML, backfill it from Gmail so subsequent opens are instant.
    */
-  async function onOpenEmail(row: CachedMessageRow) {
+  async function onOpenEmail(row: CachedMessageMeta) {
     setSelectedRowId(row.id)
-    const initial = decryptedById[row.id]
-    if (!initial) return
-    if (initial.bodyHtml && initial.bodyHtml.length > 0) return
-    if (!dek || !accounts) return
-    const account = accounts.find((a) => a.id === row.account_id)
-    if (!account) return
+    if (bodiesById[row.id] || !dek) return
+    setLoadingBodyId(row.id)
     try {
+      // One row's body, fetched only now that it's being read.
+      const full = await getCachedPayload(row.id)
+      const dec = full ? await decryptCachedPayload(full, dek) : null
+      if (dec?.bodyHtml) {
+        setBodiesById((prev) => ({ ...prev, [row.id]: { bodyText: dec.bodyText, bodyHtml: dec.bodyHtml ?? '' } }))
+        return
+      }
+      if (dec) {
+        setBodiesById((prev) => ({ ...prev, [row.id]: { bodyText: dec.bodyText, bodyHtml: '' } }))
+      }
+      // Legacy entry without HTML: backfill it from Gmail once.
+      const account = accounts?.find((a) => a.id === row.account_id)
+      if (!account) return
       const accessToken = await getAccessToken(account, dek)
-      const full = await getMessage(accessToken, row.gmail_message_id)
-      const parsed = parseMessage(full)
+      const parsed = parseMessage(await getMessage(accessToken, row.gmail_message_id))
       const m = detectTwoFactor({
         subject: parsed.subject,
         from: parsed.from,
@@ -362,17 +446,16 @@ function InboxDesktop() {
         bodyText: parsed.bodyText,
         labelIds: parsed.labelIds,
       })
-      const is2fa = !!m && m.confidence >= 0.6
-      await upsertCachedMessage(account.user_id, account.id, parsed, is2fa, dek)
-      const updatedDec: DecryptedCachedMessage = {
-        ...initial,
-        bodyText: parsed.bodyText,
-        bodyHtml: parsed.bodyHtml,
-        snippet: parsed.snippet,
-      }
-      setDecryptedById((prev) => ({ ...prev, [row.id]: updatedDec }))
+      await upsertCachedMessage(account.user_id, account.id, parsed, !!m && m.confidence >= 0.6, dek)
+      setBodiesById((prev) => ({
+        ...prev,
+        [row.id]: { bodyText: parsed.bodyText, bodyHtml: parsed.bodyHtml },
+      }))
     } catch (err) {
-      console.warn('[inbox] backfill HTML failed for', row.id, err)
+      console.warn('[inbox] loading body failed for', row.id, err)
+      toast.error('Could not load this email')
+    } finally {
+      setLoadingBodyId((cur) => (cur === row.id ? null : cur))
     }
   }
 
@@ -382,7 +465,7 @@ function InboxDesktop() {
    * pulls each image part (inline body or attachments.get). Memoised per row.
    */
   const loadCidImages = useCallback(
-    async (row: CachedMessageRow): Promise<Record<string, string>> => {
+    async (row: CachedMessageMeta): Promise<Record<string, string>> => {
       const cached = cidCacheRef.current[row.id]
       if (cached) return cached
       if (!dek || !accounts) return {}
@@ -456,7 +539,7 @@ function InboxDesktop() {
                 <input
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search subject, sender, body…"
+                  placeholder="Search subject, sender, preview…"
                   className="input pl-9 pr-9"
                 />
                 {searchQuery && (
@@ -506,7 +589,15 @@ function InboxDesktop() {
               </div>
             </div>
 
-            <div className="card flex-1 divide-y divide-ink-800 overflow-y-auto p-0">
+            <div
+              className="card flex-1 divide-y divide-ink-800 overflow-y-auto p-0"
+              onScroll={(e) => {
+                const el = e.currentTarget
+                if (el.scrollTop + el.clientHeight > el.scrollHeight - 400) {
+                  setVisibleCount((n) => (n < filteredRows.length ? n + LIST_CHUNK : n))
+                }
+              }}
+            >
               {filteredRows.length === 0 ? (
                 <p className="px-4 py-10 text-center text-sm text-ink-400">
                   {searchQuery || activeFilter !== 'all' || selectedAccountIds.size > 0
@@ -516,8 +607,8 @@ function InboxDesktop() {
                     : "No emails in cache yet — they'll appear here as the poller picks them up."}
                 </p>
               ) : (
-                filteredRows.map((r) => {
-                  const dec = decryptedById[r.id]
+                filteredRows.slice(0, visibleCount).map((r) => {
+                  const dec = headersById[r.id]
                   const unread = dec?.labelIds.includes('UNREAD')
                   const isSelected = selectedRowId === r.id
                   return (
@@ -586,6 +677,8 @@ function InboxDesktop() {
                 isAuthSender={authSenders.has(senderEmail(selectedRow.sender))}
                 onClose={() => setSelectedRowId(null)}
                 loadCidImages={() => loadCidImages(selectedRow)}
+                bodyLoaded={!!selectedBody}
+                bodyLoading={loadingBodyId === selectedRow.id}
               />
             ) : (
               <div className="flex h-full flex-col items-center justify-center gap-2 text-ink-500">
@@ -658,8 +751,10 @@ function PreviewPane({
   isAuthSender,
   onClose,
   loadCidImages,
+  bodyLoaded,
+  bodyLoading,
 }: {
-  row: CachedMessageRow
+  row: CachedMessageMeta
   message: DecryptedCachedMessage
   accountEmail: string
   onArchive: () => void
@@ -669,6 +764,8 @@ function PreviewPane({
   isAuthSender: boolean
   onClose: () => void
   loadCidImages: () => Promise<Record<string, string>>
+  bodyLoaded: boolean
+  bodyLoading: boolean
 }) {
   return (
     <>
@@ -727,7 +824,12 @@ function PreviewPane({
         </div>
       </header>
       <div className="flex-1 overflow-y-auto bg-white">
-        {message.bodyHtml && message.bodyHtml.trim().length > 0 ? (
+        {!bodyLoaded ? (
+          <p className="flex items-center gap-2 p-5 text-sm text-gray-500">
+            {bodyLoading ? <Loader2 size={14} className="animate-spin" /> : null}
+            {bodyLoading ? 'Loading email' : 'Could not load this email'}
+          </p>
+        ) : message.bodyHtml && message.bodyHtml.trim().length > 0 ? (
           <HtmlEmailRenderer
             key={row.id}
             html={message.bodyHtml}

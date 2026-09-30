@@ -5,6 +5,11 @@
  *   - Plaintext metadata: gmail_message_id (PK dedup), thread_id, sender,
  *     received_at, is_2fa_candidate, popped_at.
  *   - Encrypted blob: { subject, snippet, body_text } JSON, AES-GCM under DEK.
+ *   - Encrypted header: { subject, snippet, fromName, labelIds } only, ~300 B,
+ *     same DEK. The inbox list reads THIS, never the payload: the payloads
+ *     average ~48 KB (full HTML), and selecting 1,000 of them (44 MB) on every
+ *     inbox open timed out and took the nano database down (2026-09-30,
+ *     KEY-PERF-1). Bodies are fetched one row at a time when a message opens.
  *
  * Why some metadata stays plaintext: the dedup index needs `gmail_message_id`,
  * the inbox query orders by `received_at`, and `popped_at` gates re-popping
@@ -16,7 +21,8 @@ import { supabase } from './supabase'
 import { decryptJson, encryptJson } from './encryption'
 import type { ParsedMessage } from './google/gmail'
 
-export interface CachedMessageRow {
+/** Plaintext row metadata plus the small encrypted header. No body. */
+export interface CachedMessageMeta {
   id: string
   user_id: string
   account_id: string
@@ -25,14 +31,29 @@ export interface CachedMessageRow {
   received_at: string
   sender: string | null
   is_2fa_candidate: boolean
-  encrypted_payload: string
   iv_payload: string
+  /** Null on rows written before headers existed; backfilled by the inbox. */
+  encrypted_header: string | null
+  iv_header: string | null
   popped_at: string | null
   created_at: string
   /** AI classification: true = worth reading, false = noise, null = not yet classified. */
   is_important: boolean | null
   classified_at: string | null
   classification_reason: string | null
+}
+
+/** A row including the full encrypted body. Only ever fetched by id. */
+export interface CachedMessageRow extends CachedMessageMeta {
+  encrypted_payload: string
+}
+
+/** What the inbox list needs to render a row. */
+export interface CachedMessageHeader {
+  subject: string
+  snippet: string
+  fromName: string
+  labelIds: string[]
 }
 
 export interface CachedMessagePayload {
@@ -56,8 +77,18 @@ export interface DecryptedCachedMessage extends CachedMessagePayload {
   popped_at: string | null
 }
 
-const COLUMNS =
-  'id, user_id, account_id, gmail_message_id, thread_id, received_at, sender, is_2fa_candidate, encrypted_payload, iv_payload, popped_at, created_at, is_important, classified_at, classification_reason'
+/** Everything except encrypted_payload. Safe to select in bulk. */
+const META_COLUMNS =
+  'id, user_id, account_id, gmail_message_id, thread_id, received_at, sender, is_2fa_candidate, iv_payload, encrypted_header, iv_header, popped_at, created_at, is_important, classified_at, classification_reason'
+
+/** Rows per request for bulk metadata reads (PostgREST caps a response at 1,000). */
+const PAGE = 500
+/** Rows per request when bodies are needed in bulk (~48 KB each on average). */
+const PAYLOAD_BATCH = 10
+
+function headerOf(p: CachedMessagePayload): CachedMessageHeader {
+  return { subject: p.subject, snippet: p.snippet, fromName: p.fromName, labelIds: p.labelIds }
+}
 
 /**
  * Upsert a parsed message into the cache. Returns true if the row was newly
@@ -70,7 +101,7 @@ export async function upsertCachedMessage(
   parsed: ParsedMessage,
   is2faCandidate: boolean,
   dek: Uint8Array,
-): Promise<{ inserted: boolean; row: CachedMessageRow }> {
+): Promise<{ inserted: boolean; row: CachedMessageMeta }> {
   // Check existence first so we can report inserted-vs-updated.
   const { data: existing } = await supabase
     .from('email_message_cache')
@@ -88,6 +119,7 @@ export async function upsertCachedMessage(
     labelIds: parsed.labelIds,
   }
   const { ciphertext, iv } = await encryptJson(payload, dek)
+  const header = await encryptJson(headerOf(payload), dek)
 
   const upsertRow = {
     user_id: userId,
@@ -99,14 +131,17 @@ export async function upsertCachedMessage(
     is_2fa_candidate: is2faCandidate,
     encrypted_payload: ciphertext,
     iv_payload: iv,
+    encrypted_header: header.ciphertext,
+    iv_header: header.iv,
   }
+  // Don't echo the ~48 KB payload back; the caller has it already.
   const { data, error } = await supabase
     .from('email_message_cache')
     .upsert(upsertRow, { onConflict: 'user_id,gmail_message_id' })
-    .select(COLUMNS)
+    .select(META_COLUMNS)
     .single()
   if (error) throw error
-  return { inserted: !existing, row: data as CachedMessageRow }
+  return { inserted: !existing, row: data as CachedMessageMeta }
 }
 
 /**
@@ -129,19 +164,136 @@ export async function countCachedSince(sinceIso: string): Promise<number> {
   return count ?? 0
 }
 
+/**
+ * Newest-first metadata + encrypted headers, paged past PostgREST's silent
+ * 1,000-row cap. Never includes bodies. `onPage` lets the inbox paint the
+ * first page before the rest arrive.
+ */
 export async function listCachedMessages(opts: {
   accountId?: string | null
   limit?: number
-} = {}): Promise<CachedMessageRow[]> {
-  let query = supabase
+  onPage?: (rowsSoFar: CachedMessageMeta[]) => void
+} = {}): Promise<CachedMessageMeta[]> {
+  const limit = opts.limit ?? 100
+  const out: CachedMessageMeta[] = []
+  while (out.length < limit) {
+    const from = out.length
+    const to = Math.min(from + PAGE, limit) - 1
+    let query = supabase
+      .from('email_message_cache')
+      .select(META_COLUMNS)
+      .order('received_at', { ascending: false })
+      .order('id', { ascending: false })
+      .range(from, to)
+    if (opts.accountId) query = query.eq('account_id', opts.accountId)
+    const { data, error } = await query
+    if (error) throw error
+    const page = (data ?? []) as CachedMessageMeta[]
+    out.push(...page)
+    opts.onPage?.(out.slice())
+    if (page.length < to - from + 1) break
+  }
+  return out
+}
+
+/** One message's full encrypted body. */
+export async function getCachedPayload(rowId: string): Promise<CachedMessageRow | null> {
+  const { data, error } = await supabase
     .from('email_message_cache')
-    .select(COLUMNS)
-    .order('received_at', { ascending: false })
-    .limit(opts.limit ?? 100)
-  if (opts.accountId) query = query.eq('account_id', opts.accountId)
-  const { data, error } = await query
+    .select(`${META_COLUMNS}, encrypted_payload`)
+    .eq('id', rowId)
+    .maybeSingle()
   if (error) throw error
-  return (data ?? []) as CachedMessageRow[]
+  return (data as CachedMessageRow | null) ?? null
+}
+
+/** A request failed with a 5xx: the database is struggling, so stop bulk work. */
+export class ServerStrainError extends Error {
+  constructor(public status: number, message: string) {
+    super(`Supabase ${status}: ${message}`)
+    this.name = 'ServerStrainError'
+  }
+}
+
+/** Full bodies for several rows, PAYLOAD_BATCH per request so no single query is heavy. */
+export async function getCachedPayloads(rowIds: string[]): Promise<CachedMessageRow[]> {
+  const out: CachedMessageRow[] = []
+  for (let i = 0; i < rowIds.length; i += PAYLOAD_BATCH) {
+    const { data, error, status } = await supabase
+      .from('email_message_cache')
+      .select(`${META_COLUMNS}, encrypted_payload`)
+      .in('id', rowIds.slice(i, i + PAYLOAD_BATCH))
+    if (status >= 500) throw new ServerStrainError(status, error?.message ?? 'server error')
+    if (error) throw error
+    out.push(...((data ?? []) as CachedMessageRow[]))
+  }
+  return out
+}
+
+/** Decrypt a row's header, or null if the row predates headers. */
+export async function decryptCachedHeader(
+  row: CachedMessageMeta,
+  dek: Uint8Array,
+): Promise<CachedMessageHeader | null> {
+  if (!row.encrypted_header || !row.iv_header) return null
+  return decryptJson<CachedMessageHeader>(row.encrypted_header, row.iv_header, dek)
+}
+
+/**
+ * Write the header for a legacy row (derived from its decrypted payload).
+ * Touches only the header columns.
+ */
+export async function backfillCachedHeader(
+  rowId: string,
+  payload: CachedMessagePayload,
+  dek: Uint8Array,
+): Promise<CachedMessageHeader> {
+  const header = headerOf(payload)
+  const { ciphertext, iv } = await encryptJson(header, dek)
+  const { error, status } = await supabase
+    .from('email_message_cache')
+    .update({ encrypted_header: ciphertext, iv_header: iv })
+    .eq('id', rowId)
+  if (status >= 500) throw new ServerStrainError(status, error?.message ?? 'server error')
+  if (error) console.warn('[email] header backfill failed:', rowId, error)
+  return header
+}
+
+/**
+ * Header for any row: decrypt the stored header, or (legacy rows) fetch the
+ * body once, derive the header and save it so the next read is cheap.
+ */
+export async function resolveHeaders(
+  rows: CachedMessageMeta[],
+  dek: Uint8Array,
+): Promise<Record<string, CachedMessageHeader>> {
+  const out: Record<string, CachedMessageHeader> = {}
+  const legacy: string[] = []
+  for (const r of rows) {
+    try {
+      const h = await decryptCachedHeader(r, dek)
+      if (h) out[r.id] = h
+      else legacy.push(r.id)
+    } catch (err) {
+      console.warn('[email] header decrypt failed', r.id, err)
+    }
+  }
+  for (const full of await getCachedPayloads(legacy)) {
+    try {
+      out[full.id] = await backfillCachedHeader(full.id, await decryptPayloadOnly(full, dek), dek)
+    } catch (err) {
+      if (err instanceof ServerStrainError) throw err
+      console.warn('[email] legacy header failed', full.id, err)
+    }
+  }
+  return out
+}
+
+async function decryptPayloadOnly(
+  row: CachedMessageRow,
+  dek: Uint8Array,
+): Promise<CachedMessagePayload> {
+  return decryptJson<CachedMessagePayload>(row.encrypted_payload, row.iv_payload, dek)
 }
 
 export async function setPoppedAt(
@@ -200,16 +352,49 @@ export async function setMessageImportance(
   if (error) console.warn('[email] setMessageImportance failed:', error)
 }
 
-/** Rows that haven't been AI-classified yet (is_important IS NULL). */
-export async function listUnclassifiedMessages(limit = 500): Promise<CachedMessageRow[]> {
+/** Rows that haven't been AI-classified yet (is_important IS NULL). Metadata only. */
+export async function listUnclassifiedMessages(limit = 500): Promise<CachedMessageMeta[]> {
+  const out: CachedMessageMeta[] = []
+  while (out.length < limit) {
+    const from = out.length
+    const to = Math.min(from + PAGE, limit) - 1
+    const { data, error } = await supabase
+      .from('email_message_cache')
+      .select(META_COLUMNS)
+      .is('is_important', null)
+      .order('received_at', { ascending: false })
+      .order('id', { ascending: false })
+      .range(from, to)
+    if (error) throw error
+    const page = (data ?? []) as CachedMessageMeta[]
+    out.push(...page)
+    if (page.length < to - from + 1) break
+  }
+  return out
+}
+
+/** Important, non-2FA emails received after `sinceIso`, newest first. Metadata only. */
+export async function listImportantSince(sinceIso: string, limit = 30): Promise<CachedMessageMeta[]> {
   const { data, error } = await supabase
     .from('email_message_cache')
-    .select(COLUMNS)
-    .is('is_important', null)
+    .select(META_COLUMNS)
+    .eq('is_important', true)
+    .eq('is_2fa_candidate', false)
+    .gt('received_at', sinceIso)
     .order('received_at', { ascending: false })
     .limit(limit)
   if (error) throw error
-  return (data ?? []) as CachedMessageRow[]
+  return (data ?? []) as CachedMessageMeta[]
+}
+
+/** How many rows still need classifying. A HEAD count: no rows cross the wire. */
+export async function countUnclassifiedMessages(): Promise<number> {
+  const { count, error } = await supabase
+    .from('email_message_cache')
+    .select('id', { count: 'exact', head: true })
+    .is('is_important', null)
+  if (error) throw error
+  return count ?? 0
 }
 
 // ── Inbox prefs (Tauri plugin-store; local-only — doesn't sync to Supabase) ──
