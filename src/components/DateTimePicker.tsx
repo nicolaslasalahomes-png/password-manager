@@ -180,7 +180,7 @@ export default function DateTimePicker({
                   title={mark?.label ?? undefined}
                   className={`relative flex h-8 items-center justify-center rounded text-xs transition ${
                     isSelected
-                      ? 'bg-accent-600 font-semibold text-white'
+                      ? 'bg-accent-600 font-semibold text-on-accent'
                       : isToday
                       ? 'font-bold text-accent-300'
                       : inMonth

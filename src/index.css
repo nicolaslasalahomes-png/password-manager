@@ -3,6 +3,67 @@
 @tailwind utilities;
 
 @layer base {
+  /* Night preset. Overridden at runtime by applyTheme() in src/lib/theme.ts. */
+  :root {
+    color-scheme: dark;
+    --red-50: 254 242 242;
+    --red-100: 254 226 226;
+    --red-200: 254 202 202;
+    --red-300: 252 165 165;
+    --red-400: 248 113 113;
+    --red-500: 239 68 68;
+    --red-600: 220 38 38;
+    --red-700: 185 28 28;
+    --red-800: 153 27 27;
+    --red-900: 127 29 29;
+    --red-950: 69 10 10;
+    --amber-50: 255 251 235;
+    --amber-100: 254 243 199;
+    --amber-200: 253 230 138;
+    --amber-300: 252 211 77;
+    --amber-400: 251 191 36;
+    --amber-500: 245 158 11;
+    --amber-600: 217 119 6;
+    --amber-700: 180 83 9;
+    --amber-800: 146 64 14;
+    --amber-900: 120 53 15;
+    --amber-950: 69 26 3;
+    --emerald-50: 236 253 245;
+    --emerald-100: 209 250 229;
+    --emerald-200: 167 243 208;
+    --emerald-300: 110 231 183;
+    --emerald-400: 52 211 153;
+    --emerald-500: 16 185 129;
+    --emerald-600: 5 150 105;
+    --emerald-700: 4 120 87;
+    --emerald-800: 6 95 70;
+    --emerald-900: 6 78 59;
+    --emerald-950: 2 44 34;
+    --on-accent: 4 19 29;
+    --ink-950: 7 10 19;
+    --accent-950: 2 27 42;
+    --ink-900: 16 19 28;
+    --accent-900: 2 38 57;
+    --ink-800: 27 31 40;
+    --accent-800: 5 59 86;
+    --ink-700: 41 45 55;
+    --accent-700: 30 97 134;
+    --ink-600: 56 60 70;
+    --accent-600: 14 165 233;
+    --ink-500: 97 102 112;
+    --accent-500: 40 177 245;
+    --ink-400: 121 125 135;
+    --accent-400: 80 189 251;
+    --ink-300: 173 176 186;
+    --accent-300: 133 206 251;
+    --ink-200: 208 211 220;
+    --accent-200: 177 223 253;
+    --ink-100: 230 233 242;
+    --accent-100: 208 235 253;
+    --ink-50: 241 244 253;
+    --accent-50: 225 243 255;
+
+  }
   html, body, #root {
     @apply h-full;
   }
@@ -13,9 +74,9 @@
   input:-webkit-autofill,
   input:-webkit-autofill:hover,
   input:-webkit-autofill:focus {
-    -webkit-box-shadow: 0 0 0 1000px theme('colors.ink.800') inset !important;
-    -webkit-text-fill-color: theme('colors.ink.100') !important;
-    caret-color: theme('colors.ink.100');
+    -webkit-box-shadow: 0 0 0 1000px rgb(var(--ink-800)) inset !important;
+    -webkit-text-fill-color: rgb(var(--ink-100)) !important;
+    caret-color: rgb(var(--ink-100));
   }
 }
 
@@ -24,7 +85,7 @@
     @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-ink-950;
   }
   .btn-primary {
-    @apply btn bg-accent-600 text-white hover:bg-accent-500 focus:ring-accent-500;
+    @apply btn bg-accent-600 text-on-accent hover:bg-accent-500 focus:ring-accent-500;
   }
   .btn-secondary {
     @apply btn bg-ink-700 text-ink-100 hover:bg-ink-600 focus:ring-ink-500;

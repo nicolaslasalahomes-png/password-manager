@@ -222,7 +222,7 @@ export default function Calendar() {
                     <span
                       className={`text-[11px] tabular-nums ${
                         isToday
-                          ? 'rounded-full bg-accent-500 px-1.5 py-0.5 font-bold text-white'
+                          ? 'rounded-full bg-accent-500 px-1.5 py-0.5 font-bold text-on-accent'
                           : 'text-ink-300'
                       }`}
                     >
@@ -342,7 +342,7 @@ function DayDetailPanel({
                 key={c}
                 onClick={() => onSetColor(c, labelDraft || null)}
                 className={`h-7 w-7 rounded-md ring-2 ring-offset-2 ring-offset-ink-900 transition ${
-                  mark?.color === c ? 'ring-white' : 'ring-transparent hover:ring-ink-600'
+                  mark?.color === c ? 'ring-ink-50' : 'ring-transparent hover:ring-ink-600'
                 }`}
                 style={{ backgroundColor: c }}
                 title={c}
