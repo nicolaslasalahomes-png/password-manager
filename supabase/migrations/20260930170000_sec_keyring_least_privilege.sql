@@ -67,7 +67,8 @@ alter default privileges for role postgres in schema public revoke all on tables
 alter default privileges for role postgres in schema public revoke all on sequences from public, anon, authenticated;
 alter default privileges for role postgres in schema public revoke execute on functions from public, anon, authenticated;
 
--- Ledger (this project had none): record VAULT-1's migration and this one.
+-- Ledger (this project had none): record VAULT-1's migration, this one, and KEY-PERF-1's
+-- email_header_columns (applied 30 Sep ~13:32 UTC, before this one).
 create schema if not exists supabase_migrations;
 create table if not exists supabase_migrations.schema_migrations (
   version text primary key,
@@ -77,5 +78,6 @@ create table if not exists supabase_migrations.schema_migrations (
 revoke all on schema supabase_migrations from public, anon, authenticated;
 insert into supabase_migrations.schema_migrations (version, name) values
   ('20260930160000', 'vault1_sealed_inbox'),
-  ('20260930170000', 'sec_keyring_least_privilege')
+  ('20260930170000', 'sec_keyring_least_privilege'),
+  ('20260930180000', 'email_header_columns')
 on conflict (version) do nothing;
