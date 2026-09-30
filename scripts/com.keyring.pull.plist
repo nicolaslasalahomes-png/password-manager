@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- VAULT-2: collect Nicolas's replies from the Keyring Needs-you card every 2 minutes.
+     Install: cp to ~/Library/LaunchAgents/ and `launchctl bootstrap gui/$(id -u) <path>`. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.keyring.pull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nicolassutcliffe/.local/bin/node</string>
+    <string>/Users/nicolassutcliffe/password-manager/scripts/keyring-pull.mjs</string>
+  </array>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/nicolassutcliffe/Library/Logs/keyring-pull.log</string>
+  <key>StandardErrorPath</key><string>/Users/nicolassutcliffe/Library/Logs/keyring-pull.log</string>
+</dict>
+</plist>
