@@ -13,13 +13,14 @@
  *   over the JSON padded with spaces to a 4 KB bucket, header as additional data; then ECDSA
  *   P-256 over header + ciphertext with the writer's signing key, which the app has pinned.
  *
- * Secrets: INBOX_WRITE_SECRET and WRITER_SIGNING_PRIVATE_JWK come from the environment, else from
- * the memory file reference_keyring_inbox_writer.md (KEY=value lines). Never commit them.
- * The vault's inbox public key is fetched from the function and PINNED on first use (its SHA-256
- * is written to that memory file); if it ever changes, this refuses to seal. A swapped key would
- * otherwise send the list to whoever swapped it.
+ * Secrets live ONLY in ~/.config/keyring-inbox/ on the Mac (dir 700, files 600): `write-secret` and
+ * `writer-signing-private.jwk`. Never in the repo, and never in the Claude memory folder, which is
+ * synced to a server. The vault's inbox public key is fetched from the function and PINNED on first
+ * use (its SHA-256 goes in the memory file reference_keyring_inbox_writer.md, which holds no secrets);
+ * if it ever changes, this refuses to seal. A swapped key would otherwise send the list to whoever
+ * swapped it.
  */
-import { readFileSync, appendFileSync } from 'node:fs'
+import { readFileSync, appendFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -29,6 +30,7 @@ export const PAD_BUCKET = 4096
 const LABEL = 'keyring-inbox-v1'
 const FUNCTION_URL = 'https://wwylhsetxpopxmtupfhn.supabase.co/functions/v1/keyring-inbox-put'
 const MEMORY_FILE = path.join(homedir(), '.claude/projects/-Users-nicolassutcliffe/memory/reference_keyring_inbox_writer.md')
+const SECRETS_DIR = path.join(homedir(), '.config/keyring-inbox')
 const enc = new TextEncoder()
 const b64 = (u) => Buffer.from(u).toString('base64')
 
@@ -118,11 +120,11 @@ export function toPayload(snap) {
   return { v: 1, source: 'needs_you', list_no: snap.list_no, created_at, items }
 }
 
-function secret(name) {
-  if (process.env[name]) return process.env[name]
-  const m = readFileSync(MEMORY_FILE, 'utf8').match(new RegExp(`^${name}=(.+)$`, 'm'))
-  if (!m) throw new Error(`${name} is not set and not in ${MEMORY_FILE}`)
-  return m[1].trim()
+function secret(file) {
+  const p = path.join(SECRETS_DIR, file)
+  const mode = statSync(p).mode & 0o777
+  if (mode & 0o077) throw new Error(`${p} is readable by others (mode ${mode.toString(8)}): chmod 600 it`)
+  return readFileSync(p, 'utf8').trim()
 }
 
 async function call(body, writeSecret) {
@@ -152,8 +154,8 @@ async function main() {
   if (!file) throw new Error('usage: keyring-push.mjs <needs-you.json> [--dry-run]')
   const dry = flags.includes('--dry-run')
   const payload = toPayload(JSON.parse(readFileSync(file, 'utf8')))
-  const writeSecret = secret('INBOX_WRITE_SECRET')
-  const writerPrivateJwk = JSON.parse(secret('WRITER_SIGNING_PRIVATE_JWK'))
+  const writeSecret = secret('write-secret')
+  const writerPrivateJwk = JSON.parse(secret('writer-signing-private.jwk'))
 
   const { public_key_jwk: recipientPublicJwk } = await call({ action: 'pubkey' }, writeSecret)
   if (!recipientPublicJwk) throw new Error('Keyring has no inbox key yet: open Keyring and unlock it once')
