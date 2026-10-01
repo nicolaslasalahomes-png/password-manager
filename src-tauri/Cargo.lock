@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-desktop"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "base64 0.22.1",
  "core-foundation",

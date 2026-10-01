@@ -1,41 +1,54 @@
 /**
- * Sliding-window rate limiter.
+ * Sliding-window rate limiter with two priority lanes.
  *
- * `createRateLimiter(40)` returns an async `acquire()` that resolves as soon
- * as fewer than 40 calls have happened in the trailing 60s, otherwise waits
- * until the oldest call ages out of the window. Shared across all callers
- * (e.g. every Gmail account's poller) so the cap is global, not per-account.
+ * `createRateLimiter(240)` returns an async `acquire(priority)` that resolves
+ * as soon as fewer than 240 calls have happened in the trailing 60s, otherwise
+ * waits until the oldest call ages out of the window. Shared across all
+ * callers (e.g. every Gmail account's poller) so the cap is global.
  *
- * Acquisition is serialized through a promise chain so concurrent callers
- * can't all read stale window state and overshoot the cap. The serialized
- * section is trivial (array filter + push) when under the limit, so this adds
- * negligible latency in the common case and only blocks when genuinely capped.
+ * Priority (KEY-2FA-1): a waiting 'high' caller (a new-mail poll, a message
+ * that just arrived, something the user clicked) is always granted before
+ * any waiting 'low' caller (bootstrap backfill of old inbox mail). Before
+ * this, one FIFO queue meant a 2FA email could sit behind hundreds of
+ * backfill fetches for minutes.
+ *
+ * Grants happen in a single pump, so concurrent callers can't all read stale
+ * window state and overshoot the cap.
  */
-export function createRateLimiter(maxPerWindow: number, windowMs = 60_000) {
-  let timestamps: number[] = []
-  let chain: Promise<void> = Promise.resolve()
+export type RatePriority = 'high' | 'low'
 
-  return async function acquire(): Promise<void> {
-    const prev = chain
-    let release!: () => void
-    chain = new Promise<void>((r) => {
-      release = r
-    })
-    await prev
-    try {
-      // eslint-disable-next-line no-constant-condition
-      for (;;) {
-        const now = Date.now()
-        timestamps = timestamps.filter((t) => now - t < windowMs)
-        if (timestamps.length < maxPerWindow) {
-          timestamps.push(now)
-          return
-        }
-        const waitMs = windowMs - (now - timestamps[0]) + 50
-        await new Promise((r) => setTimeout(r, waitMs))
-      }
-    } finally {
-      release()
+export interface RateLimiter {
+  (priority?: RatePriority): Promise<void>
+  /** Waiting callers per lane (for tests and diagnostics). */
+  pending(): { high: number; low: number }
+}
+
+export function createRateLimiter(maxPerWindow: number, windowMs = 60_000): RateLimiter {
+  let timestamps: number[] = []
+  const high: Array<() => void> = []
+  const low: Array<() => void> = []
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  function pump() {
+    timer = null
+    const now = Date.now()
+    timestamps = timestamps.filter((t) => now - t < windowMs)
+    while (timestamps.length < maxPerWindow && (high.length || low.length)) {
+      const next = (high.length ? high : low).shift()!
+      timestamps.push(now)
+      next()
+    }
+    if ((high.length || low.length) && timer === null) {
+      const waitMs = Math.max(0, windowMs - (now - timestamps[0])) + 50
+      timer = setTimeout(pump, waitMs)
     }
   }
+
+  const acquire = ((priority: RatePriority = 'high') =>
+    new Promise<void>((resolve) => {
+      ;(priority === 'low' ? low : high).push(resolve)
+      if (timer === null) pump()
+    })) as RateLimiter
+  acquire.pending = () => ({ high: high.length, low: low.length })
+  return acquire
 }

@@ -315,6 +315,10 @@ struct SessionState {
     /// to gate the Reopen handler — macOS fires Reopen as a side effect of
     /// the popover lifecycle and we don't want that to bring main forward.
     popover_activity_at: Mutex<Option<Instant>>,
+    /// The latest 2FA popover payload (JSON), parked by the main window
+    /// before it opens the popover so a popover that starts listening late
+    /// can still pull it (KEY-2FA-1). Process memory only; cleared on close.
+    two_fa_payload: Mutex<Option<String>>,
 }
 
 impl Default for SessionState {
@@ -324,6 +328,7 @@ impl Default for SessionState {
             keyring_was_frontmost_before_popover: AtomicBool::new(false),
             main_currently_visible: AtomicBool::new(true),
             popover_activity_at: Mutex::new(None),
+            two_fa_payload: Mutex::new(None),
         }
     }
 }
@@ -445,6 +450,81 @@ fn handle_popover_close(app: tauri::AppHandle, state: tauri::State<'_, SessionSt
     macos_focus::hide_app_via_keystroke();
 }
 
+/// KEY-2FA-1: park / read / clear the 2FA popover payload. See
+/// src/lib/twoFactorPopoverController.ts for the handshake.
+#[tauri::command]
+fn set_2fa_payload(payload: String, state: tauri::State<'_, SessionState>) {
+    if let Ok(mut guard) = state.two_fa_payload.lock() {
+        *guard = Some(payload);
+    }
+}
+
+#[tauri::command]
+fn get_2fa_payload(state: tauri::State<'_, SessionState>) -> Option<String> {
+    state.two_fa_payload.lock().ok().and_then(|g| g.clone())
+}
+
+#[tauri::command]
+fn clear_2fa_payload(state: tauri::State<'_, SessionState>) {
+    if let Ok(mut guard) = state.two_fa_payload.lock() {
+        *guard = None;
+    }
+}
+
+/// KEY-2FA-1: keep the Gmail poller on time while Keyring sits hidden in the
+/// tray. macOS App Nap coalesces timers of hidden apps and WebKit throttles
+/// timers of hidden pages (measured ingest lag 55-236 s on a 10 s poll).
+#[cfg(target_os = "macos")]
+mod macos_background {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, msg_send_id, sel};
+
+    /// NSActivityUserInitiatedAllowingIdleSystemSleep: opts the app out of
+    /// App Nap but still lets the Mac sleep. Held for the process lifetime.
+    pub fn opt_out_of_app_nap() {
+        const OPTIONS: u64 = 0x00FF_FFFF & !(1u64 << 20);
+        unsafe {
+            let info: Retained<AnyObject> = msg_send_id![class!(NSProcessInfo), processInfo];
+            let reason: Retained<AnyObject> = msg_send_id![
+                class!(NSString),
+                stringWithUTF8String: c"Keyring watches Gmail for 2FA codes".as_ptr()
+            ];
+            let token: Retained<AnyObject> =
+                msg_send_id![&*info, beginActivityWithOptions: OPTIONS, reason: &*reason];
+            std::mem::forget(token);
+        }
+    }
+
+    /// Hidden-page DOM timer throttling and visibility-based process
+    /// suppression are separate from `backgroundThrottling` (which sets
+    /// inactiveSchedulingPolicy). WKPreferences SPI, each guarded by
+    /// respondsToSelector so a WebKit without them is a no-op.
+    pub unsafe fn unthrottle_hidden_page(webview: *mut AnyObject) {
+        if webview.is_null() {
+            return;
+        }
+        let config: *mut AnyObject = msg_send![webview, configuration];
+        if config.is_null() {
+            return;
+        }
+        let prefs: *mut AnyObject = msg_send![config, preferences];
+        if prefs.is_null() {
+            return;
+        }
+        let responds = |s: objc2::runtime::Sel| -> bool { msg_send![prefs, respondsToSelector: s] };
+        if responds(sel!(_setHiddenPageDOMTimerThrottlingEnabled:)) {
+            let _: () = msg_send![prefs, _setHiddenPageDOMTimerThrottlingEnabled: false];
+        }
+        if responds(sel!(_setHiddenPageDOMTimerThrottlingAutoIncreases:)) {
+            let _: () = msg_send![prefs, _setHiddenPageDOMTimerThrottlingAutoIncreases: false];
+        }
+        if responds(sel!(_setPageVisibilityBasedProcessSuppressionEnabled:)) {
+            let _: () = msg_send![prefs, _setPageVisibilityBasedProcessSuppressionEnabled: false];
+        }
+    }
+}
+
 /// Bring the main window to the front. Used by tray clicks and global hotkey.
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -487,6 +567,18 @@ pub fn run() {
                         .level(log::LevelFilter::Info)
                         .build(),
                 )?;
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                macos_background::opt_out_of_app_nap();
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.with_webview(|wv| unsafe {
+                        macos_background::unthrottle_hidden_page(
+                            wv.inner() as *mut objc2::runtime::AnyObject,
+                        );
+                    });
+                }
             }
 
             // System tray (menubar on macOS)
@@ -547,7 +639,10 @@ pub fn run() {
             biometric_delete,
             oauth::start_google_oauth,
             browser::open_url,
-            image_fetch::fetch_image
+            image_fetch::fetch_image,
+            set_2fa_payload,
+            get_2fa_payload,
+            clear_2fa_payload
         ])
         .on_window_event(|window, event| {
             // Close button hides the window (like macOS apps), doesn't quit.

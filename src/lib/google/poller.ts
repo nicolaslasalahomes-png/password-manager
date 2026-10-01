@@ -2,9 +2,17 @@
  * Gmail poller — the engine behind the auto-popover.
  *
  * Lifecycle:
- *   - startGmailPoller() runs immediately, then every `intervalMs` (~10s).
- *   - Skips ticks while document.hidden (window minimized / app backgrounded).
+ *   - startGmailPoller() runs immediately, then every `intervalMs` (~10s), and
+ *     again whenever the window becomes visible. Runs while hidden too: the
+ *     main webview has background throttling disabled (tauri.conf.json) and
+ *     the app holds an App Nap opt-out (lib.rs), see KEY-2FA-1.
  *   - Per account: bootstrap (first time) or incremental via history.
+ *   - A tick never waits for a slow account: each account runs on its own
+ *     (in-flight guard per account), so one account's bootstrap can't hold up
+ *     another account's new mail (KEY-2FA-1).
+ *   - Bootstrap takes the mailbox cursor from /profile FIRST, so incremental
+ *     polling starts on the very next tick; the 200-message backfill of old
+ *     mail runs separately at 'low' limiter priority.
  *   - Per new message: parse → detect → cache. If 2FA detected and we haven't
  *     popped this message before → call on2faDetected(); mark popped_at so
  *     we don't re-pop on the next tick.
@@ -21,11 +29,14 @@ import {
   GmailAuthError,
   GmailRateLimitError,
   getMessage,
+  getProfileHistoryId,
   listHistory,
   listMessages,
   parseMessage,
+  type GmailMessageRef,
   type ParsedMessage,
 } from './gmail'
+import type { RatePriority } from '../rateLimit'
 import {
   GoogleOAuthError,
 } from './oauth'
@@ -107,24 +118,100 @@ export function startGmailPoller(opts: {
 }): PollerHandle {
   const interval = opts.intervalMs ?? 10_000
   const state = new Map<string, PerAccountState>()
-  let backoffStep = new Map<string, number>()
+  const backoffStep = new Map<string, number>()
+  const backfilling = new Set<string>()
   let stopped = false
-  let timer: number | null = null
-  // Re-entrancy guard so a slow tick doesn't overlap with the next interval fire.
+  let timer: ReturnType<typeof setInterval> | null = null
+  // Re-entrancy guard for the account listing only. Account polls are NOT
+  // awaited by the tick (see header).
   let ticking = false
   // User's manual "always auth" sender list — refreshed each tick, read by the
-  // per-message 2FA detection inside pollOne.
+  // per-message 2FA detection.
   let authSenders: string[] = []
 
-  function shouldSkipThisTick(): boolean {
-    // Previously paused on document.hidden so the poller only ran when Keyring
-    // had focus. Removed — the user explicitly wants 24/7 background polling so
-    // the 2FA popover fires while they're working in other apps. The Tauri tray
-    // icon keeps the process alive even when the main window is hidden.
-    //
-    // Trade-offs at this cadence (10s tick × ~6 accounts × ~5 quota units = ~3
-    // quota/sec): well under Gmail's per-user 250/sec cap and trivial CPU.
-    return false
+  /**
+   * Fetch, detect, cache one message. Pops the 2FA popover when the message
+   * is a fresh insert, a confident 2FA match, not already popped, and
+   * received at or after `popNotBefore` (ms epoch).
+   */
+  async function processMessage(
+    account: EmailAccountRow,
+    accessToken: string,
+    ref: GmailMessageRef,
+    popNotBefore: number,
+    priority: RatePriority,
+  ): Promise<void> {
+    const full = await getMessage(accessToken, ref.id, priority)
+    if (stopped) return
+    const parsed = parseMessage(full)
+    const match = detectTwoFactor(
+      {
+        subject: parsed.subject,
+        from: parsed.from,
+        snippet: parsed.snippet,
+        bodyText: parsed.bodyText,
+        bodyHtml: parsed.bodyHtml,
+        labelIds: parsed.labelIds,
+      },
+      { authSenders },
+    )
+    const is2fa = !!match && match.confidence >= AUTO_POP_THRESHOLD
+    const { inserted, row } = await upsertCachedMessage(
+      opts.userId,
+      account.id,
+      parsed,
+      is2fa,
+      opts.dek,
+    )
+
+    // Fire-and-forget AI classification on FRESH inserts only.
+    if (inserted) {
+      void classifyInBackground(row.id, parsed)
+    }
+
+    if (!(inserted && is2fa && !row.popped_at)) return
+    // A 2FA popover must only ever fire for an email that JUST arrived: never
+    // for week-old mail re-surfaced by a cursor reset, never for mail that
+    // existed before the account was linked (backfill passes its start time).
+    const receivedMs = new Date(parsed.receivedAt).getTime()
+    await setPoppedAt(row.id)
+    if (receivedMs >= popNotBefore && !stopped) {
+      try {
+        opts.callbacks.on2faDetected(account, parsed, match!)
+      } catch (cbErr) {
+        console.warn('[poller] on2faDetected callback threw:', cbErr)
+      }
+    } else {
+      console.debug(
+        `[poller] suppressed stale 2FA popover for "${parsed.subject}" (received ${parsed.receivedAt})`,
+      )
+    }
+  }
+
+  /**
+   * Bootstrap backfill: the newest 200 inbox messages so a newly-linked (or
+   * re-bootstrapped) account has history in the inbox. 'low' priority, so it
+   * never delays new mail. Does not hold the account's in-flight guard.
+   */
+  async function backfill(account: EmailAccountRow, accessToken: string, startedAt: number) {
+    if (backfilling.has(account.id)) return
+    backfilling.add(account.id)
+    try {
+      const { messages } = await listMessages(accessToken, 'in:inbox', 200, 'high')
+      for (const ref of messages) {
+        if (stopped) return
+        try {
+          // Pops only for mail that arrived after the bootstrap began.
+          await processMessage(account, accessToken, ref, startedAt, 'low')
+        } catch (msgErr) {
+          console.warn(`[poller] backfill message ${ref.id} failed:`, msgErr)
+        }
+      }
+    } catch (err) {
+      console.warn(`[poller] ${account.email}: backfill failed:`, err)
+    } finally {
+      backfilling.delete(account.id)
+    }
   }
 
   async function pollOne(account: EmailAccountRow): Promise<void> {
@@ -138,17 +225,14 @@ export function startGmailPoller(opts: {
     try {
       const accessToken = await getAccessToken(account, opts.dek)
 
-      let newMessageRefs: { id: string; threadId: string }[] = []
-      let nextHistoryId: string | null = null
-
       if (!account.history_id) {
-        // Bootstrap — read the latest 200 inbox messages so newly-linked
-        // accounts start with substantive history. Do NOT auto-pop (these
-        // existed before the user linked the account).
-        const { messages } = await listMessages(accessToken, 'in:inbox', 200)
-        newMessageRefs = messages
-        // We'll set the cursor from the first message we fetch, since the
-        // listMessages response doesn't include historyId.
+        // Bootstrap. Cursor first (one cheap call), so the next tick already
+        // sees new mail; then backfill old mail in the background.
+        const startedAt = Date.now()
+        const historyId = await getProfileHistoryId(accessToken)
+        await updateHistoryCursor(account.id, historyId)
+        account.history_id = historyId
+        void backfill(account, accessToken, startedAt)
       } else {
         const hist = await listHistory(accessToken, account.history_id)
         if (hist.tooOld) {
@@ -156,99 +240,21 @@ export function startGmailPoller(opts: {
           await updateHistoryCursor(account.id, '') // empty string → treat as bootstrap
           return
         }
-        newMessageRefs = hist.added
-        nextHistoryId = hist.historyId
-      }
-
-      // Process each new message ref.
-      for (const ref of newMessageRefs) {
-        try {
-          const full = await getMessage(accessToken, ref.id)
-          const parsed = parseMessage(full)
-          // historyId from a getMessage call isn't returned; we use the
-          // listHistory's nextHistoryId, or for bootstrap we leave it and
-          // fetch fresh on next tick.
-          const match = detectTwoFactor(
-            {
-              subject: parsed.subject,
-              from: parsed.from,
-              snippet: parsed.snippet,
-              bodyText: parsed.bodyText,
-              bodyHtml: parsed.bodyHtml,
-              labelIds: parsed.labelIds,
-            },
-            { authSenders },
-          )
-          const is2fa = !!match && match.confidence >= AUTO_POP_THRESHOLD
-          const { inserted, row } = await upsertCachedMessage(
-            opts.userId,
-            account.id,
-            parsed,
-            is2fa,
-            opts.dek,
-          )
-
-          // Fire-and-forget AI classification on FRESH inserts only. The
-          // poller doesn't await this; the importance flag lands in the DB
-          // a few hundred ms later and the inbox UI picks it up on next refresh.
-          if (inserted) {
-            void classifyInBackground(row.id, parsed)
+        // Newest first: in a burst, the code you are waiting for is usually
+        // the last message added.
+        const popNotBefore = Date.now() - MAX_POP_AGE_MS
+        for (const ref of [...hist.added].reverse()) {
+          if (stopped) return
+          try {
+            await processMessage(account, accessToken, ref, popNotBefore, 'high')
+          } catch (msgErr) {
+            console.warn(`[poller] message ${ref.id} failed:`, msgErr)
           }
-
-          // Pop only on FRESH inserts (not on re-fetches of bootstrap rows),
-          // only when we have a real cursor (i.e., not bootstrap), only if not
-          // already popped — AND only if the email actually just arrived. The
-          // freshness check is what stops week-old emails from popping when the
-          // history cursor expires and we re-bootstrap.
-          const fresh =
-            new Date(parsed.receivedAt).getTime() >= Date.now() - MAX_POP_AGE_MS
-          if (
-            inserted &&
-            is2fa &&
-            !row.popped_at &&
-            account.history_id // never pop on the first-ever bootstrap
-          ) {
-            if (fresh) {
-              await setPoppedAt(row.id)
-              try {
-                opts.callbacks.on2faDetected(account, parsed, match!)
-              } catch (cbErr) {
-                console.warn('[poller] on2faDetected callback threw:', cbErr)
-              }
-            } else {
-              // Stale 2FA email surfaced as "new" (cursor reset / re-surface).
-              // Mark it popped so it never queues, but don't show the popover.
-              await setPoppedAt(row.id)
-              console.debug(
-                `[poller] suppressed stale 2FA popover for "${parsed.subject}" (received ${parsed.receivedAt})`,
-              )
-            }
-          }
-        } catch (msgErr) {
-          // Individual message failure — log and continue with the next.
-          console.warn(`[poller] message ${ref.id} failed:`, msgErr)
         }
-      }
-
-      // After the bootstrap pass, set history_id so future ticks use incremental.
-      if (!account.history_id && newMessageRefs.length > 0) {
-        // Re-fetch one message to grab its historyId — Gmail's bootstrap APIs
-        // don't return a global cursor. Cheap (1 unit).
-        try {
-          const probe = await getMessage(accessToken, newMessageRefs[0].id)
-          // The message object includes `historyId` on it. (It's typed loosely
-          // here; cast.)
-          const probeHistoryId = (probe as unknown as { historyId?: string }).historyId
-          if (probeHistoryId) {
-            await updateHistoryCursor(account.id, probeHistoryId)
-            account.history_id = probeHistoryId // mutate locally so we don't re-bootstrap next tick
-          }
-        } catch (probeErr) {
-          console.warn('[poller] could not set history cursor after bootstrap:', probeErr)
+        if (hist.historyId && hist.historyId !== account.history_id) {
+          await updateHistoryCursor(account.id, hist.historyId)
+          account.history_id = hist.historyId
         }
-      } else if (nextHistoryId && nextHistoryId !== account.history_id) {
-        await updateHistoryCursor(account.id, nextHistoryId)
-        account.history_id = nextHistoryId
       }
 
       // Reset backoff on success.
@@ -257,7 +263,7 @@ export function startGmailPoller(opts: {
     } catch (err) {
       if (err instanceof GmailAuthError) {
         // getAccessToken should have refreshed before we got here; if Gmail
-        // still says 401, the refresh token is dead. Try one explicit re-fetch.
+        // still says 401, the refresh token is dead.
         // (getAccessToken already marks needs_reauth on `invalid_grant`.)
         console.warn(`[poller] ${account.email}: auth error, may need reauth`)
       } else if (err instanceof GmailRateLimitError) {
@@ -280,33 +286,40 @@ export function startGmailPoller(opts: {
 
   async function tick(): Promise<void> {
     if (stopped || ticking) return
-    if (shouldSkipThisTick()) return
     ticking = true
+    let accounts: EmailAccountRow[] = []
     try {
-      let accounts: EmailAccountRow[] = []
-      try {
-        accounts = await listAccounts()
-        authSenders = await getAuthSenders()
-      } catch (listErr) {
-        opts.callbacks.onError?.(null, listErr)
-        return
-      }
-      await Promise.allSettled(accounts.map((a) => pollOne(a)))
+      accounts = await listAccounts()
+      authSenders = await getAuthSenders()
+    } catch (listErr) {
+      opts.callbacks.onError?.(null, listErr)
+      return
     } finally {
       ticking = false
     }
+    if (stopped) return
+    // Deliberately not awaited: a slow account must not delay the others.
+    for (const a of accounts) void pollOne(a)
+  }
+
+  const onVisible = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') void tick()
   }
 
   // Kick off immediately, then on interval.
   void tick()
-  timer = window.setInterval(() => void tick(), interval)
+  timer = setInterval(() => void tick(), interval)
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
 
   return {
     stop() {
       stopped = true
       if (timer !== null) {
-        window.clearInterval(timer)
+        clearInterval(timer)
         timer = null
+      }
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisible)
       }
     },
   }

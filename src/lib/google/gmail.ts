@@ -7,17 +7,22 @@
  * the poller can retry once with a refreshed token and then give up.
  */
 
-import { createRateLimiter } from '../rateLimit'
+import { createRateLimiter, type RatePriority } from '../rateLimit'
 
 const BASE = 'https://gmail.googleapis.com/gmail/v1/users/me'
 
 /**
- * Global Gmail API rate limiter — max 40 calls/minute across ALL accounts.
- * Prevents the bootstrap (one getMessage per ~200 messages × N accounts) from
- * bursting into Gmail's per-user rate limit. Shared module-level instance so
- * concurrent account polls draw from the same budget.
+ * Global Gmail API rate limiter, shared by every account and the Inbox page.
+ *
+ * KEY-2FA-1: was 40/min FIFO. Five accounts polled every 10s already spend
+ * 30/min on /history alone, so any burst of new mail (or a bootstrap of 200
+ * messages) queued for minutes and a fresh 2FA email waited behind it. Now
+ * 240/min (4/s, ~20 quota units/s, far under Gmail's 250 units/user/s) with
+ * two lanes: polls, new mail and user clicks are 'high'; bootstrap backfill
+ * of old mail is 'low' and only gets what high traffic leaves over.
  */
-const gmailLimiter = createRateLimiter(40)
+export const GMAIL_CALLS_PER_MINUTE = 240
+const gmailLimiter = createRateLimiter(GMAIL_CALLS_PER_MINUTE)
 
 export class GmailAuthError extends Error {
   constructor() {
@@ -87,8 +92,9 @@ async function gfetch(
   accessToken: string,
   path: string,
   init: RequestInit = {},
+  priority: RatePriority = 'high',
 ): Promise<Response> {
-  await gmailLimiter()
+  await gmailLimiter(priority)
   const headers = new Headers(init.headers)
   headers.set('Authorization', `Bearer ${accessToken}`)
   if (init.body && !headers.has('Content-Type')) {
@@ -109,20 +115,36 @@ export async function listMessages(
   accessToken: string,
   q?: string,
   maxResults = 50,
+  priority: RatePriority = 'high',
 ): Promise<{ messages: GmailMessageRef[]; latestHistoryId?: string }> {
   const params = new URLSearchParams()
   if (q) params.set('q', q)
   params.set('maxResults', String(maxResults))
-  const resp = await gfetch(accessToken, `/messages?${params}`)
+  const resp = await gfetch(accessToken, `/messages?${params}`, {}, priority)
   const json = (await resp.json()) as { messages?: GmailMessageRef[]; resultSizeEstimate?: number }
   return { messages: json.messages ?? [] }
 }
 
-export async function getMessage(accessToken: string, id: string): Promise<GmailMessage> {
+export async function getMessage(
+  accessToken: string,
+  id: string,
+  priority: RatePriority = 'high',
+): Promise<GmailMessage> {
   // format=full returns headers + body parts. metadata-only would mean a second
   // call to read the body; one call is simpler.
-  const resp = await gfetch(accessToken, `/messages/${id}?format=full`)
+  const resp = await gfetch(accessToken, `/messages/${id}?format=full`, {}, priority)
   return (await resp.json()) as GmailMessage
+}
+
+/**
+ * The mailbox's current history cursor. Used to start incremental polling the
+ * moment an account (re)bootstraps, before the slow backfill of old mail.
+ */
+export async function getProfileHistoryId(accessToken: string): Promise<string> {
+  const resp = await gfetch(accessToken, '/profile')
+  const json = (await resp.json()) as { historyId?: string }
+  if (!json.historyId) throw new Error('Gmail /profile returned no historyId')
+  return json.historyId
 }
 
 /**

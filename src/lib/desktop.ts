@@ -216,9 +216,10 @@ export async function closeQuickAddWindow(): Promise<void> {
 // ── 2FA popover window (separate borderless mini-window) ────────────────────
 // Mirrors the quick-add window shape: dedicated WebviewWindow, loaded with
 // `index.html#2fa-popover`, ~360x280, alwaysOnTop, bottom-right. The poller
-// fires open2faPopover() the moment it detects a verification email; payload
-// is delivered via the `2fa://show` Tauri event so the same window can be
-// re-used for back-to-back emails (the popover handles dedup itself).
+// fires open2faPopover() the moment it detects a verification email. The
+// payload is parked in Rust (`set_2fa_payload`) and also pushed via the
+// `2fa://show` event; the popover subscribes, then pulls, so neither a cold
+// window nor a reused one can miss it (KEY-2FA-1). Dedup is by message id.
 
 const TWO_FA_POPOVER_LABEL = '2fa-popover'
 const TWO_FA_POPOVER_WIDTH = 380
@@ -243,6 +244,12 @@ export async function open2faPopover(payload: TwoFactorPayload): Promise<void> {
     const { WebviewWindow, getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
     const { primaryMonitor } = await import('@tauri-apps/api/window')
     const { emit } = await import('@tauri-apps/api/event')
+    const { invoke } = await import('@tauri-apps/api/core')
+
+    // KEY-2FA-1: park the payload in Rust BEFORE the window exists. A cold
+    // popover pulls it after subscribing, so the event below can arrive
+    // before the popover listens and nothing is lost. Local IPC only.
+    await invoke('set_2fa_payload', { payload: JSON.stringify(payload) })
 
     const existing = (await getAllWebviewWindows()).find((w) => w.label === TWO_FA_POPOVER_LABEL)
     if (existing) {
@@ -250,7 +257,7 @@ export async function open2faPopover(payload: TwoFactorPayload): Promise<void> {
       await existing.unminimize()
       // Don't setFocus() — same reasoning as the first-create branch below:
       // we want the popover visible without stealing the user's keyboard focus.
-      // Popover is listening for this event and will swap to the new payload.
+      // A mounted popover swaps to the new payload on this event.
       await emit('2fa://show', payload)
       return
     }
@@ -294,11 +301,8 @@ export async function open2faPopover(payload: TwoFactorPayload): Promise<void> {
 
     w.once('tauri://created', async () => {
       await w.show()
-      // No setFocus() — see focus:false note above. The popover appears on
-      // top, the user's keyboard focus stays in their current app.
-      window.setTimeout(() => {
-        void emit('2fa://show', payload)
-      }, 80)
+      // No setFocus(), see focus:false note above. No event needed here:
+      // the new popover pulls the parked payload once it is listening.
     })
     w.once('tauri://error', (e) => {
       console.warn('[desktop] 2fa popover error', e)
@@ -308,9 +312,20 @@ export async function open2faPopover(payload: TwoFactorPayload): Promise<void> {
   }
 }
 
+/** Popover side: the payload parked by open2faPopover, or null. */
+export async function pull2faPayload(): Promise<TwoFactorPayload | null> {
+  if (!isDesktop()) return null
+  const { invoke } = await import('@tauri-apps/api/core')
+  const raw = await invoke<string | null>('get_2fa_payload')
+  return raw ? (JSON.parse(raw) as TwoFactorPayload) : null
+}
+
 export async function close2faPopover(): Promise<void> {
   if (!isDesktop()) return
   try {
+    // Don't keep a code in memory longer than the popover shows it.
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('clear_2fa_payload').catch(() => {})
     const { getAllWebviewWindows } = await import('@tauri-apps/api/webviewWindow')
     const w = (await getAllWebviewWindows()).find((w) => w.label === TWO_FA_POPOVER_LABEL)
     if (w) await w.close()
