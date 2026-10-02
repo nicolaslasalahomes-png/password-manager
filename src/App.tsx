@@ -7,6 +7,8 @@ import { useIdleLock } from './lib/useIdleLock'
 import {
   checkForUpdate,
   getStoreValue,
+  gmailWatchAccounts,
+  gmailWatchGet,
   isDesktop,
   onTrayEvent,
   open2faPopover,
@@ -15,6 +17,17 @@ import {
   unregisterAllHotkeys,
 } from './lib/desktop'
 import { startGmailPoller } from './lib/google/poller'
+import { clearAccessTokenCache, listAccountCursors } from './lib/google/tokens'
+import {
+  mustWipeGmailTokens,
+  popoverPayloadFor,
+  startLockedGmailWatch,
+  watchModeFor,
+} from './lib/google/lockedWatch'
+import { armLockedWatch, wipeLockedWatch } from './lib/google/watchArm'
+import { getAuthSenders } from './lib/email'
+import type { ParsedMessage } from './lib/google/gmail'
+import type { TwoFactorMatch } from './lib/google/twoFactor'
 import {
   generateBriefing,
   getBriefingEnabled,
@@ -49,6 +62,15 @@ const DEFAULT_IDLE_TIMEOUT_MIN = 30 // desktop default; web fallback inside the 
 
 export default function App() {
   const { user, loading: authLoading, mfaPending } = useAuth()
+
+  // KEY-2FA-2: the stronger lock (signed out, or the email code is owed after
+  // a fresh sign-in or app launch) holds no Gmail tokens at all.
+  useEffect(() => {
+    if (!isDesktop()) return
+    if (mustWipeGmailTokens({ authLoading, signedIn: !!user, mfaPending })) {
+      void wipeLockedWatch()
+    }
+  }, [authLoading, user, mfaPending])
 
   if (authLoading) return <FullPageLoader label="Loading session…" />
 
@@ -197,37 +219,54 @@ function SignedInShell() {
     }
   }, [])
 
-  // Gmail poller — fires the 2FA popover whenever a verification email arrives.
-  // Only active on desktop + unlocked vault. Stops on lock or sign-out via the
-  // effect cleanup.
+  // Gmail 2FA watch. Unlocked: the full poller (inbox cache, AI triage,
+  // cursor) and it arms the Rust watch with the refresh tokens. Locked
+  // (idle auto-lock or Lock): the locked watch keeps popping codes through
+  // Rust and holds no DEK and no Gmail token (KEY-2FA-2). This shell only
+  // mounts once signed in with the email code done, so 'off' here means
+  // no vault yet. Stops on every change via the effect cleanup.
+  const watchMode = watchModeFor({
+    desktop: isDesktop(),
+    signedIn: !!user,
+    mfaPending: false,
+    vault: vaultStatus,
+  })
+  // By id: the Supabase user object is replaced on every hourly token refresh,
+  // which must not restart the watch (it would lose the locked cursor).
+  const watchUserId = user?.id ?? null
   useEffect(() => {
-    if (!isDesktop() || vaultStatus !== 'unlocked' || !dek || !user) return
+    if (watchMode === 'off' || !watchUserId) return
+    if (watchMode === 'locked') {
+      // The webview keeps no Gmail access token once the vault locks.
+      clearAccessTokenCache()
+      const handle = startLockedGmailWatch({
+        deps: {
+          armedAccountIds: gmailWatchAccounts,
+          listAccountCursors,
+          fetcherFor: (accountId) => (path) => gmailWatchGet(accountId, path),
+          getAuthSenders,
+        },
+        callbacks: { on2faDetected: pop2fa },
+      })
+      return () => handle.stop()
+    }
+    if (!dek) return
+    const userId = watchUserId
     const handle = startGmailPoller({
       dek,
-      userId: user.id,
+      userId,
       callbacks: {
-        on2faDetected: (account, parsed, match) => {
-          void open2faPopover({
-            gmailMessageId: parsed.id,
-            accountId: account.id,
-            accountEmail: account.email,
-            fromName: parsed.fromName,
-            subject: parsed.subject,
-            code: match.code,
-            magicLink: match.link,
-            receivedAt: parsed.receivedAt,
-          })
-        },
+        on2faDetected: pop2fa,
+        onAccounts: (accounts) => void armLockedWatch(userId, accounts, dek),
         onError: (account, err) => {
-          // Surface only the account-needs-reauth case to the user; other
-          // errors stay in the console to avoid notification spam during
-          // transient network blips.
+          // Other errors stay in the console to avoid notification spam
+          // during transient network blips.
           console.warn('[gmail-poller]', account?.email ?? '(global)', err)
         },
       },
     })
     return () => handle.stop()
-  }, [vaultStatus, dek, user])
+  }, [watchMode, dek, watchUserId])
 
   // Task notification scheduler — fires native macOS notifications based on
   // each task's priority + the user's configured work hours. Only active on
@@ -347,4 +386,13 @@ function SignedInShell() {
       {showFirstRun && <HotkeyFirstRunModal onDismiss={() => setShowFirstRun(false)} />}
     </>
   )
+}
+
+/** Show the 2FA popover (code, link, sender only: nothing from the vault). */
+function pop2fa(
+  account: { id: string; email: string },
+  parsed: ParsedMessage,
+  match: TwoFactorMatch,
+): void {
+  void open2faPopover(popoverPayloadFor(account, parsed, match))
 }

@@ -56,6 +56,7 @@ import {
 } from '../email'
 import { AUTO_POP_THRESHOLD, detectTwoFactor, type TwoFactorMatch } from './twoFactor'
 import { classifyEmail } from '../ai/classifier'
+import { markPopped, wasPopped } from './popLedger'
 
 export interface PollerHandle {
   stop: () => void
@@ -68,6 +69,11 @@ export interface PollerCallbacks {
     match: TwoFactorMatch,
   ) => void
   onError?: (account: EmailAccountRow | null, err: unknown) => void
+  /**
+   * KEY-2FA-2: the account list of every tick, so App.tsx can arm the Rust
+   * Gmail watch that keeps popping codes once the vault locks.
+   */
+  onAccounts?: (accounts: EmailAccountRow[]) => void
 }
 
 interface PerAccountState {
@@ -175,7 +181,9 @@ export function startGmailPoller(opts: {
     // existed before the account was linked (backfill passes its start time).
     const receivedMs = new Date(parsed.receivedAt).getTime()
     await setPoppedAt(row.id)
+    if (wasPopped(parsed.id)) return // already popped while the vault was locked
     if (receivedMs >= popNotBefore && !stopped) {
+      markPopped(parsed.id)
       try {
         opts.callbacks.on2faDetected(account, parsed, match!)
       } catch (cbErr) {
@@ -298,6 +306,11 @@ export function startGmailPoller(opts: {
       ticking = false
     }
     if (stopped) return
+    try {
+      opts.callbacks.onAccounts?.(accounts)
+    } catch (armErr) {
+      console.warn('[poller] onAccounts threw:', armErr)
+    }
     // Deliberately not awaited: a slow account must not delay the others.
     for (const a of accounts) void pollOne(a)
   }

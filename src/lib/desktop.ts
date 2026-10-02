@@ -334,6 +334,61 @@ export async function close2faPopover(): Promise<void> {
   }
 }
 
+// ── Gmail watch while the vault is locked (KEY-2FA-2) ───────────────────────
+// Rust holds the Gmail refresh tokens (process memory only) so 2FA codes keep
+// popping while the vault is locked. The webview arms it while unlocked and
+// afterwards only asks for read-only calls by account id + path; it never gets
+// a token back. See src-tauri/src/gmail_watch.rs.
+
+export interface GmailWatchArmAccount {
+  id: string
+  refresh_token: string
+}
+
+export async function gmailWatchArm(args: {
+  userId: string
+  clientId: string
+  clientSecret: string
+  accounts: GmailWatchArmAccount[]
+}): Promise<void> {
+  if (!isDesktop()) return
+  const { invoke } = await import('@tauri-apps/api/core')
+  await invoke('gmail_watch_arm', {
+    userId: args.userId,
+    clientId: args.clientId,
+    clientSecret: args.clientSecret,
+    accounts: args.accounts,
+  })
+}
+
+/** Zero and drop every Gmail token Rust holds. Safe to call any time. */
+export async function gmailWatchWipe(): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('gmail_watch_wipe')
+  } catch (err) {
+    console.warn('[desktop] gmail_watch_wipe failed', err)
+  }
+}
+
+/** Ids of the accounts Rust can poll (no secrets). */
+export async function gmailWatchAccounts(): Promise<string[]> {
+  if (!isDesktop()) return []
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke<string[]>('gmail_watch_accounts')
+}
+
+/** One read-only Gmail GET through Rust, as a fetch Response. */
+export async function gmailWatchGet(accountId: string, path: string): Promise<Response> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  const reply = await invoke<{ status: number; body: string }>('gmail_watch_get', {
+    accountId,
+    path,
+  })
+  return new Response(reply.body, { status: reply.status })
+}
+
 /** Open an external URL in the user's default browser (Rust shells out via tauri-plugin-shell). */
 export async function openExternalUrl(url: string): Promise<void> {
   if (!isDesktop()) {

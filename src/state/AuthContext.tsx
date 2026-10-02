@@ -9,6 +9,7 @@ import {
 } from 'react'
 import type { Session, User } from '@supabase/supabase-js'
 import { supabase } from '../lib/supabase'
+import { wipeLockedWatch } from '../lib/google/watchArm'
 
 // Module-level flag tracking which user has already cleared MFA *this app run*.
 //
@@ -136,6 +137,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (error) throw error
     // Fresh sign-in invalidates any prior "verified" flag — a new factor is owed.
     mfaVerifiedForUserId = null
+    // KEY-2FA-2: and while that factor is owed, no Gmail tokens are held.
+    void wipeLockedWatch()
     // NOTE: we deliberately do NOT send the OTP here. Sending from this exact
     // moment (fresh JWT, Login screen unmounting, possibly-cold edge function)
     // proved unreliable — the first email never arrived. The MfaChallenge
@@ -145,6 +148,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     mfaVerifiedForUserId = null
+    await wipeLockedWatch() // KEY-2FA-2: signed out holds no Gmail tokens
     await supabase.auth.signOut()
   }, [])
 

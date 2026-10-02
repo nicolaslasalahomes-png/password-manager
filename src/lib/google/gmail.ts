@@ -88,19 +88,25 @@ interface HistoryResponse {
   historyId?: string
 }
 
+/**
+ * Read-only GET of a Gmail API path (e.g. `/profile`) by someone else who holds
+ * the token. KEY-2FA-2: while the vault is locked the tokens live only in Rust
+ * (src-tauri/src/gmail_watch.rs) and the webview passes one of these instead
+ * of an access token.
+ */
+export type GmailFetcher = (path: string) => Promise<Response>
+
+/** An access token, or a token-holding fetcher (GET only). */
+export type GmailAuth = string | GmailFetcher
+
 async function gfetch(
-  accessToken: string,
+  auth: GmailAuth,
   path: string,
   init: RequestInit = {},
   priority: RatePriority = 'high',
 ): Promise<Response> {
   await gmailLimiter(priority)
-  const headers = new Headers(init.headers)
-  headers.set('Authorization', `Bearer ${accessToken}`)
-  if (init.body && !headers.has('Content-Type')) {
-    headers.set('Content-Type', 'application/json')
-  }
-  const resp = await fetch(`${BASE}${path}`, { ...init, headers })
+  const resp = await send(auth, path, init)
   if (resp.status === 401) throw new GmailAuthError()
   if (resp.status === 429) throw new GmailRateLimitError()
   if (!resp.ok) {
@@ -108,6 +114,21 @@ async function gfetch(
     throw new Error(`Gmail ${path} failed (${resp.status}): ${text.slice(0, 200)}`)
   }
   return resp
+}
+
+function send(auth: GmailAuth, path: string, init: RequestInit = {}): Promise<Response> {
+  if (typeof auth !== 'string') {
+    if (init.method && init.method !== 'GET') {
+      throw new Error('Gmail fetcher is read-only')
+    }
+    return auth(path)
+  }
+  const headers = new Headers(init.headers)
+  headers.set('Authorization', `Bearer ${auth}`)
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  return fetch(`${BASE}${path}`, { ...init, headers })
 }
 
 /** List messages by query. Used only for the bootstrap fetch (first link). */
@@ -126,13 +147,13 @@ export async function listMessages(
 }
 
 export async function getMessage(
-  accessToken: string,
+  auth: GmailAuth,
   id: string,
   priority: RatePriority = 'high',
 ): Promise<GmailMessage> {
   // format=full returns headers + body parts. metadata-only would mean a second
   // call to read the body; one call is simpler.
-  const resp = await gfetch(accessToken, `/messages/${id}?format=full`, {}, priority)
+  const resp = await gfetch(auth, `/messages/${id}?format=full`, {}, priority)
   return (await resp.json()) as GmailMessage
 }
 
@@ -140,8 +161,8 @@ export async function getMessage(
  * The mailbox's current history cursor. Used to start incremental polling the
  * moment an account (re)bootstraps, before the slow backfill of old mail.
  */
-export async function getProfileHistoryId(accessToken: string): Promise<string> {
-  const resp = await gfetch(accessToken, '/profile')
+export async function getProfileHistoryId(auth: GmailAuth): Promise<string> {
+  const resp = await gfetch(auth, '/profile')
   const json = (await resp.json()) as { historyId?: string }
   if (!json.historyId) throw new Error('Gmail /profile returned no historyId')
   return json.historyId
@@ -153,7 +174,7 @@ export async function getProfileHistoryId(accessToken: string): Promise<string> 
  * cursor is too old (404), the caller should re-bootstrap via listMessages.
  */
 export async function listHistory(
-  accessToken: string,
+  auth: GmailAuth,
   startHistoryId: string,
 ): Promise<{ historyId: string; added: GmailMessageRef[]; tooOld: boolean }> {
   const params = new URLSearchParams({
@@ -161,9 +182,7 @@ export async function listHistory(
     historyTypes: 'messageAdded',
   })
   await gmailLimiter()
-  const resp = await fetch(`${BASE}/history?${params}`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  })
+  const resp = await send(auth, `/history?${params}`)
   if (resp.status === 401) throw new GmailAuthError()
   if (resp.status === 429) throw new GmailRateLimitError()
   if (resp.status === 404) {

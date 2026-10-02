@@ -32,10 +32,13 @@ export interface EmailAccountRow {
 const COLUMNS =
   'id, user_id, email, provider, encrypted_refresh_token, iv_refresh_token, scopes, history_id, last_synced_at, status, created_at'
 
-/** In-memory access-token cache. Wiped on lock (via lockVault → not here; we
- *  rely on the cache living only as long as the JS heap, which a window
- *  reload also clears). Per-account so multiple accounts can poll concurrently. */
+/** In-memory access-token cache, per account so accounts poll concurrently.
+ *  Cleared the moment the vault locks (App.tsx, KEY-2FA-2): while locked the
+ *  webview holds no Gmail token at all; the locked watch goes through Rust. */
 const accessTokenCache = new Map<string, { token: string; expiresAt: number }>()
+/** Bumped by clearAccessTokenCache so a refresh already in flight when the
+ *  vault locks cannot put a token back afterwards. */
+let cacheGeneration = 0
 
 export async function saveAccount(
   userId: string,
@@ -79,6 +82,27 @@ export async function listAccounts(): Promise<EmailAccountRow[]> {
   return (data ?? []) as EmailAccountRow[]
 }
 
+/**
+ * KEY-2FA-2: what the locked watch needs from the DB. Deliberately leaves out
+ * the encrypted refresh token columns: while the vault is locked the webview
+ * has no use for them.
+ */
+export interface AccountCursorRow {
+  id: string
+  email: string
+  history_id: string | null
+  status: string
+}
+
+export async function listAccountCursors(): Promise<AccountCursorRow[]> {
+  const { data, error } = await supabase
+    .from('email_accounts')
+    .select('id, email, history_id, status')
+    .order('created_at', { ascending: true })
+  if (error) throw error
+  return (data ?? []) as AccountCursorRow[]
+}
+
 export async function deleteAccount(id: string): Promise<void> {
   const { error } = await supabase.from('email_accounts').delete().eq('id', id)
   if (error) throw error
@@ -118,6 +142,7 @@ export async function getAccessToken(
 ): Promise<string> {
   const cached = accessTokenCache.get(account.id)
   if (cached && cached.expiresAt > Date.now()) return cached.token
+  const generation = cacheGeneration
 
   const refreshToken = await decryptJson<string>(
     account.encrypted_refresh_token,
@@ -127,7 +152,9 @@ export async function getAccessToken(
 
   try {
     const fresh = await refreshAccessToken(refreshToken)
-    accessTokenCache.set(account.id, { token: fresh.accessToken, expiresAt: fresh.expiresAt })
+    if (generation === cacheGeneration) {
+      accessTokenCache.set(account.id, { token: fresh.accessToken, expiresAt: fresh.expiresAt })
+    }
     return fresh.accessToken
   } catch (err) {
     if (err instanceof GoogleOAuthError && err.message === 'REAUTH_REQUIRED') {
@@ -137,7 +164,13 @@ export async function getAccessToken(
   }
 }
 
-/** Force-evict (e.g. on lock). */
+/** Force-evict (on lock, KEY-2FA-2). */
 export function clearAccessTokenCache(): void {
+  cacheGeneration += 1
   accessTokenCache.clear()
+}
+
+/** Test helper: how many access tokens the webview currently holds. */
+export function accessTokenCacheSize(): number {
+  return accessTokenCache.size
 }

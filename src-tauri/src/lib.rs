@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod browser;
+mod gmail_watch;
 mod image_fetch;
 mod oauth;
 
@@ -553,6 +554,7 @@ fn hide_window(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .manage(SessionState::default())
+        .manage(gmail_watch::GmailWatch::default())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -642,7 +644,11 @@ pub fn run() {
             image_fetch::fetch_image,
             set_2fa_payload,
             get_2fa_payload,
-            clear_2fa_payload
+            clear_2fa_payload,
+            gmail_watch::gmail_watch_arm,
+            gmail_watch::gmail_watch_wipe,
+            gmail_watch::gmail_watch_accounts,
+            gmail_watch::gmail_watch_get
         ])
         .on_window_event(|window, event| {
             // Close button hides the window (like macOS apps), doesn't quit.
@@ -659,6 +665,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // KEY-2FA-2: zero the Gmail watch tokens on the way out.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(watch) = app.try_state::<gmail_watch::GmailWatch>() {
+                    watch.wipe();
+                }
+                return;
+            }
             // macOS fires Reopen on dock-click AND, annoyingly, as a side
             // effect of dismissing the popover window. We only want to act
             // on the dock-click case — so we ignore Reopen events fired
