@@ -43,9 +43,18 @@ export interface DetectorOptions {
 /** Threshold for "should we auto-popup this?". */
 export const AUTO_POP_THRESHOLD = 0.6
 
-// Subject / body keywords that strongly suggest a 2FA email.
+// Subject / body keywords that strongly suggest a 2FA email. Matched against
+// accent-stripped text (see deaccent), so "Código de Verificación" reads as
+// "Codigo de Verificacion". Non-English entries are deliberately specific:
+// a bare "código" also means a discount code, so it only counts with a
+// verification/access/security qualifier.
 const SUBJECT_KEYWORDS =
-  /\b(verification|verify|security|sign[- ]?in|login|magic|confirm(?:ation)?|one[- ]?time|otp|2fa|two[- ]?factor|passcode|access\s+code|authenticate|authorization)\b/i
+  /\b(verification|verify|security|sign[- ]?in|login|magic|confirm(?:ation)?|one[- ]?time|otp|2fa|two[- ]?factor|passcode|access\s+code|authenticate|authorization|verificacion|verificar|verifica|verificacao|codigo\s+de\s+(?:verificacion|acceso|seguridad|confirmacion|inicio)|inicio\s+de\s+sesion|iniciar\s+sesion|autenticacion|un\s+solo\s+uso|code\s+de\s+(?:verification|confirmation|securite)|connexion|authentification|bestatigungscode|sicherheitscode|verifizierung|anmeldung|codice\s+di\s+(?:verifica|accesso|sicurezza))\b/i
+
+/** Strip accents so non-English wording matches the ASCII keyword lists. */
+function deaccent(s: string): string {
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+}
 
 // STRONG auth-related local-part prefixes. `noreply@` / `no-reply@` are
 // intentionally NOT here because every marketing email in existence uses them.
@@ -136,13 +145,16 @@ const LINK_BLACKLIST_HOSTS = [
 // Direct-code regexes (first match wins).
 const CODE_PATTERNS: RegExp[] = [
   // "Your verification code is 123456" / "Code: 123456" / "Use 123456 to..."
-  /(?:code|otp|pin|token|passcode)[^\d]{0,15}(\d{4,8})\b/i,
+  // (plus Spanish/Italian "código"/"codice"/"clave", accents already stripped)
+  /(?:code|codigo|codice|clave|otp|pin|token|passcode)[^\d]{0,15}(\d{4,8})\b/i,
   // "123456 is your verification code" / "123456 to sign in"
   /\b(\d{6})\s*(?:is\s+your|to\s+(?:sign|log)\s*in|verification|confirm)\b/i,
   // "G-123456" (Google's format)
   /\bG-?(\d{6})\b/,
   // Bare 6-digit (used only if subject also matches)
   /\b(\d{6})\b/,
+  // 6 digits printed with spaces or dashes, e.g. "7 1 5 5 2 5" (subject-gated)
+  /(?<![\d-])(\d(?:[ \u00a0-]\d){5})(?![\d-])/,
   // Alphanumeric token (used only if surrounding text matches)
   /(?:code|token|passcode)\s*[:\-]?\s*\b([A-Z0-9]{6,10})\b/i,
 ]
@@ -214,9 +226,9 @@ function extractCode(subject: string, bodyText: string): string | undefined {
     const pat = CODE_PATTERNS[i]
     // The bare-6-digit and alphanumeric-token patterns require subject-match
     // as a precondition (lower entropy → easier to misfire).
-    if ((i === 3 || i === 4) && !subjectHit) continue
+    if ((i === 3 || i === 4 || i === 5) && !subjectHit) continue
     const m = pat.exec(text)
-    if (m) return m[1].toUpperCase()
+    if (m) return m[1].replace(/[\s\u00a0-]/g, '').toUpperCase()
   }
 
   // Fallback for alphanumeric codes that aren't directly adjacent to "code"
@@ -317,14 +329,16 @@ export function detectTwoFactor(
     if (input.labelIds.includes('CATEGORY_FORUMS')) return null
   }
 
-  const subjectHit = SUBJECT_KEYWORDS.test(input.subject)
+  const subject = deaccent(input.subject)
+  const bodyText = deaccent(input.bodyText || input.snippet || '')
+  const subjectHit = SUBJECT_KEYWORDS.test(subject)
   const sender = classifySender(input.from)
 
   // HARD GATE 2: require a subject keyword, a strongly-auth sender, OR a
   // user-forced auth sender. Generic noreply@anything alone is not enough.
   if (!subjectHit && !sender.strongAuth && !senderForced) return null
 
-  const code = extractCode(input.subject, input.bodyText || input.snippet)
+  const code = extractCode(subject, bodyText)
   const senderDomain = (() => {
     const m = /@([\w.-]+)$/.exec(input.from)
     return m ? m[1].toLowerCase() : ''
@@ -344,7 +358,7 @@ export function detectTwoFactor(
   if (
     !code &&
     !senderForced &&
-    ONBOARDING_PHRASES.test(`${input.subject} ${input.bodyText || input.snippet || ''}`)
+    ONBOARDING_PHRASES.test(`${subject} ${bodyText}`)
   ) {
     return null
   }
