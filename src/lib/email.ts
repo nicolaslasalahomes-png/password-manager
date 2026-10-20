@@ -341,15 +341,24 @@ export async function setMessageImportance(
   important: boolean,
   reason: string,
 ): Promise<void> {
+  const classifiedAt = new Date().toISOString()
   const { error } = await supabase
     .from('email_message_cache')
     .update({
       is_important: important,
-      classified_at: new Date().toISOString(),
+      classified_at: classifiedAt,
       classification_reason: reason || null,
     })
     .eq('id', rowId)
-  if (error) console.warn('[email] setMessageImportance failed:', error)
+  if (error) {
+    console.warn('[email] setMessageImportance failed:', error)
+    return
+  }
+  // Let an open Inbox drop the row now, not on its next reload (KEY-INBOX-1).
+  if (typeof window !== 'undefined') {
+    const detail: ClassifiedDetail = { id: rowId, important, reason: reason || null, classifiedAt }
+    window.dispatchEvent(new CustomEvent(CLASSIFIED_EVENT, { detail }))
+  }
 }
 
 /** Rows that haven't been AI-classified yet (is_important IS NULL). Metadata only. */
@@ -405,6 +414,7 @@ export async function countUnclassifiedMessages(): Promise<number> {
 // for the "last seen" timestamp — it's a UI cursor, no security value.
 
 import { getStoreValue, setStoreValue } from './desktop'
+import { CLASSIFIED_EVENT, type ClassifiedDetail } from './inboxFilter'
 
 const SPAM_KEY = 'inboxSpamSenders'
 const AUTH_KEY = 'inboxAuthSenders'

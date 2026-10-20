@@ -61,6 +61,7 @@ import {
   newNonce,
 } from '../lib/emailImages'
 import { detectTwoFactor } from '../lib/google/twoFactor'
+import { CLASSIFIED_EVENT, CLASSIFY_GRACE_MS, hiddenFromMainInbox, type ClassifiedDetail } from '../lib/inboxFilter'
 
 type FilterKey = 'all' | 'unread' | '2fa' | 'today' | 'week'
 
@@ -72,8 +73,6 @@ const FILTERS: { key: FilterKey; label: string }[] = [
   { key: 'week', label: 'This week' },
 ]
 
-/** Gmail categories we consider "noise" — promotions, social, forums, spam. */
-const NOISE_LABELS = new Set(['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL', 'CATEGORY_FORUMS', 'SPAM'])
 
 export default function Inbox() {
   const isDesktop = useIsDesktop()
@@ -168,6 +167,51 @@ function InboxDesktop() {
   useEffect(() => {
     void reload()
   }, [reload])
+
+  // KEY-INBOX-1: apply AI verdicts as they land. An id we don't hold yet is
+  // new mail, so pull the list again (debounced: a backfill fires dozens).
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    const onClassified = (e: Event) => {
+      const d = (e as CustomEvent<ClassifiedDetail>).detail
+      let known = false
+      setRows((prev) => {
+        if (!prev) return prev
+        return prev.map((r) => {
+          if (r.id !== d.id) return r
+          known = true
+          return { ...r, is_important: d.important, classified_at: d.classifiedAt, classification_reason: d.reason }
+        })
+      })
+      if (!known && !reloadTimer.current) {
+        reloadTimer.current = setTimeout(() => {
+          reloadTimer.current = null
+          void reload()
+        }, 5_000)
+      }
+    }
+    window.addEventListener(CLASSIFIED_EVENT, onClassified)
+    return () => {
+      window.removeEventListener(CLASSIFIED_EVENT, onClassified)
+      if (reloadTimer.current) clearTimeout(reloadTimer.current)
+      reloadTimer.current = null
+    }
+  }, [reload])
+
+  // A row hidden while its verdict is pending must reappear (via the label
+  // heuristic) if the verdict never comes, so re-filter once the grace ends.
+  const [graceTick, setGraceTick] = useState(0)
+  useEffect(() => {
+    if (!aiEnabled || !rows) return
+    const now = Date.now()
+    const pending = rows
+      .filter((r) => r.is_important === null)
+      .map((r) => new Date(r.created_at).getTime() + CLASSIFY_GRACE_MS - now)
+      .filter((ms) => ms > 0)
+    if (pending.length === 0) return
+    const t = setTimeout(() => setGraceTick((n) => n + 1), Math.min(...pending) + 500)
+    return () => clearTimeout(t)
+  }, [rows, aiEnabled, graceTick])
 
   // Mark inbox as seen whenever the user lands on this page (clears the badge
   // on the Sidebar). Also fire a custom event so the Sidebar refreshes its
@@ -277,18 +321,20 @@ function InboxDesktop() {
     return rows.filter((r) => {
       const dec = headersById[r.id]
 
-      // Main inbox filter. AI mode takes precedence when enabled — it's
-      // strictly more accurate than heuristics. Heuristic fallback runs when
-      // AI is disabled or the row hasn't been classified yet (NULL).
+      // Main inbox filter: the AI verdict when there is one, hidden while a
+      // fresh verdict is pending, Gmail labels otherwise (src/lib/inboxFilter.ts).
       if (mode === 'main') {
         const senderAddr = senderEmail(r.sender)
-        if (senderAddr && spamSenders.has(senderAddr) && !liveIs2fa[r.id]) return false
-        if (aiEnabled && r.is_important !== null) {
-          if (r.is_important !== true && !liveIs2fa[r.id]) return false
-        } else if (dec) {
-          const hasNoise = dec.labelIds.some((l) => NOISE_LABELS.has(l))
-          if (hasNoise && !liveIs2fa[r.id]) return false
-        }
+        const hidden = hiddenFromMainInbox({
+          isImportant: r.is_important,
+          createdAt: r.created_at,
+          labelIds: dec?.labelIds ?? null,
+          is2fa: !!liveIs2fa[r.id],
+          isSpamSender: !!senderAddr && spamSenders.has(senderAddr),
+          aiEnabled,
+          now,
+        })
+        if (hidden) return false
       }
 
       // Account filter
@@ -320,7 +366,7 @@ function InboxDesktop() {
       }
       return true
     })
-  }, [rows, headersById, bodiesById, selectedAccountIds, activeFilter, searchQuery, liveIs2fa, mode, spamSenders, aiEnabled])
+  }, [rows, headersById, bodiesById, selectedAccountIds, activeFilter, searchQuery, liveIs2fa, mode, spamSenders, aiEnabled, graceTick])
 
   useEffect(() => setVisibleCount(LIST_CHUNK), [selectedAccountIds, activeFilter, searchQuery, mode])
 
