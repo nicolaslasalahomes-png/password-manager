@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 mod browser;
 mod gmail_watch;
+mod claude_mail;
 mod image_fetch;
 mod oauth;
 
@@ -555,6 +556,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(SessionState::default())
         .manage(gmail_watch::GmailWatch::default())
+        .manage(claude_mail::ClaudeMail::default())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -563,6 +565,11 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // KEY-MAIL-1: Claude's read-only local mail connection (off until Settings says on).
+            claude_mail::start(
+                app.state::<claude_mail::ClaudeMail>().inner().clone(),
+                app.state::<gmail_watch::GmailWatch>().inner().clone(),
+            );
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -648,7 +655,9 @@ pub fn run() {
             gmail_watch::gmail_watch_arm,
             gmail_watch::gmail_watch_wipe,
             gmail_watch::gmail_watch_accounts,
-            gmail_watch::gmail_watch_get
+            gmail_watch::gmail_watch_get,
+            claude_mail::claude_mail_set_enabled,
+            claude_mail::claude_mail_status
         ])
         .on_window_event(|window, event| {
             // Close button hides the window (like macOS apps), doesn't quit.
@@ -670,6 +679,7 @@ pub fn run() {
                 if let Some(watch) = app.try_state::<gmail_watch::GmailWatch>() {
                     watch.wipe();
                 }
+                claude_mail::remove_handle();
                 return;
             }
             // macOS fires Reopen on dock-click AND, annoyingly, as a side

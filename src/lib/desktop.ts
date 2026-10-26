@@ -343,6 +343,8 @@ export async function close2faPopover(): Promise<void> {
 export interface GmailWatchArmAccount {
   id: string
   refresh_token: string
+  /** The Gmail address (not secret), for Claude's mail connection (KEY-MAIL-1). */
+  email?: string
 }
 
 export async function gmailWatchArm(args: {
@@ -377,6 +379,34 @@ export async function gmailWatchAccounts(): Promise<string[]> {
   if (!isDesktop()) return []
   const { invoke } = await import('@tauri-apps/api/core')
   return invoke<string[]>('gmail_watch_accounts')
+}
+
+// ── KEY-MAIL-1: Claude's read-only local mail connection (src-tauri/src/claude_mail.rs) ──
+
+export const CLAUDE_MAIL_STORE_KEY = 'claudeMailEnabled'
+
+export interface ClaudeMailStatus {
+  enabled: boolean
+  running: boolean
+  requests: number
+  last_access_ms: number
+}
+
+/** On unless he switched it off in Settings. */
+export async function claudeMailEnabledSetting(): Promise<boolean> {
+  return (await getStoreValue<boolean>(CLAUDE_MAIL_STORE_KEY)) !== false
+}
+
+export async function claudeMailSetEnabled(enabled: boolean): Promise<void> {
+  if (!isDesktop()) return
+  const { invoke } = await import('@tauri-apps/api/core')
+  await invoke('claude_mail_set_enabled', { enabled })
+}
+
+export async function claudeMailStatus(): Promise<ClaudeMailStatus | null> {
+  if (!isDesktop()) return null
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke<ClaudeMailStatus>('claude_mail_status')
 }
 
 /** One read-only Gmail GET through Rust, as a fetch Response. */

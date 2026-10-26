@@ -60,6 +60,7 @@ export async function armLockedWatch(
         list.push({
           id: a.id,
           refresh_token: await deps.decrypt(a.encrypted_refresh_token, a.iv_refresh_token, dek),
+          email: a.email,
         })
       } catch (err) {
         console.warn(`[watch-arm] ${a.email}: could not decrypt token`, err)

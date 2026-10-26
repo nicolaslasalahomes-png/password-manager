@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+pub const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Same 30 s safety margin as the JS side (oauth.ts refreshAccessToken).
@@ -62,6 +62,8 @@ impl Drop for Secret {
 struct Account {
     refresh: Secret,
     access: Option<(Secret, Instant)>,
+    /// The Gmail address (not a secret), for KEY-MAIL-1's account list.
+    email: Option<String>,
 }
 
 struct Armed {
@@ -84,6 +86,8 @@ pub struct GmailWatch {
 pub struct ArmAccount {
     pub id: String,
     pub refresh_token: String,
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -124,6 +128,7 @@ impl GmailWatch {
                 Account {
                     refresh: Secret::new(a.refresh_token),
                     access: keep_access,
+                    email: a.email,
                 },
             );
         }
@@ -154,6 +159,17 @@ impl GmailWatch {
             .unwrap_or_default();
         ids.sort();
         ids
+    }
+
+    /// (id, email) of the armed accounts, sorted by id. No secrets.
+    pub fn accounts_with_email(&self) -> Vec<(String, Option<String>)> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(String, Option<String>)> = guard
+            .as_ref()
+            .map(|a| a.accounts.iter().map(|(id, acct)| (id.clone(), acct.email.clone())).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
     }
 
     #[cfg(test)]
@@ -318,6 +334,12 @@ fn gmail_get_blocking(url: &str, token: &Secret) -> Result<GmailReply, String> {
 /// status 401 with body "REAUTH_REQUIRED".
 pub fn get_blocking(watch: &GmailWatch, account_id: &str, path: &str) -> Result<GmailReply, String> {
     let url = checked_gmail_url(path)?;
+    get_url_blocking(watch, account_id, &url)
+}
+
+/// The refresh-and-retry loop behind every read. `url` must already have been
+/// checked against an allowlist (checked_gmail_url, or claude_mail's).
+pub fn get_url_blocking(watch: &GmailWatch, account_id: &str, url: &str) -> Result<GmailReply, String> {
     for attempt in 0..2 {
         let token = match watch.token_or_refresh_material(account_id)? {
             Ok(tok) => tok,
@@ -334,7 +356,7 @@ pub fn get_blocking(watch: &GmailWatch, account_id: &str, path: &str) -> Result<
                 }
             }
         };
-        let reply = gmail_get_blocking(&url, &token)?;
+        let reply = gmail_get_blocking(url, &token)?;
         if reply.status == 401 && attempt == 0 {
             watch.forget_access(account_id);
             continue;
@@ -399,7 +421,7 @@ mod tests {
     use super::*;
 
     fn acct(id: &str, tok: &str) -> ArmAccount {
-        ArmAccount { id: id.into(), refresh_token: tok.into() }
+        ArmAccount { id: id.into(), refresh_token: tok.into(), email: None }
     }
 
     #[test]

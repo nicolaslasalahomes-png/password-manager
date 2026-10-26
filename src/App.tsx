@@ -6,6 +6,8 @@ import { useToast } from './state/ToastContext'
 import { useIdleLock } from './lib/useIdleLock'
 import {
   checkForUpdate,
+  claudeMailEnabledSetting,
+  claudeMailSetEnabled,
   getStoreValue,
   gmailWatchAccounts,
   gmailWatchGet,
@@ -71,6 +73,16 @@ export default function App() {
       void wipeLockedWatch()
     }
   }, [authLoading, user, mfaPending])
+
+  // KEY-MAIL-1: Rust starts with Claude's mail connection off; apply his Settings choice.
+  useEffect(() => {
+    if (!isDesktop()) return
+    void claudeMailEnabledSetting()
+      .then(claudeMailSetEnabled)
+      .catch(() => {
+        /* only the main window may set it; other windows land here */
+      })
+  }, [])
 
   if (authLoading) return <FullPageLoader label="Loading session…" />
 

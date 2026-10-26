@@ -26,7 +26,14 @@ import {
   setBriefingEnabled,
 } from '../lib/briefing'
 import { type UsageStore, getUsage, resetUsage } from '../lib/ai/usage'
-import { openExternalUrl } from '../lib/desktop'
+import {
+  type ClaudeMailStatus,
+  CLAUDE_MAIL_STORE_KEY,
+  claudeMailEnabledSetting,
+  claudeMailSetEnabled,
+  claudeMailStatus,
+  openExternalUrl,
+} from '../lib/desktop'
 import {
   checkForUpdate,
   downloadAndInstallUpdate,
@@ -273,6 +280,13 @@ export default function Settings() {
               vertical
             >
               <UpdateControls status={updateStatus} setStatus={setUpdateStatus} />
+            </Row>
+            <Row
+              label="Let Claude read my email"
+              hint="Read-only, on this Mac only: Claude can search and open your emails, attachments and drafts through Keyring. It can never send, delete or change anything."
+              vertical
+            >
+              <ClaudeMailControl />
             </Row>
             <Row label="Installed version">
               <span className="font-mono text-xs text-ink-200">
@@ -603,6 +617,55 @@ function BriefingControl() {
       >
         <Sparkles size={12} /> {generating ? 'Writing…' : 'Generate one now'}
       </button>
+    </div>
+  )
+}
+
+/** KEY-MAIL-1: the switch for Claude's read-only mail connection, and what it has read. */
+function ClaudeMailControl() {
+  const toast = useToast()
+  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [status, setStatus] = useState<ClaudeMailStatus | null>(null)
+
+  useEffect(() => {
+    void claudeMailEnabledSetting().then(setEnabled)
+    void claudeMailStatus().then(setStatus)
+    const t = setInterval(() => void claudeMailStatus().then(setStatus), 5000)
+    return () => clearInterval(t)
+  }, [])
+
+  async function onToggle(next: boolean) {
+    try {
+      await claudeMailSetEnabled(next)
+      await setStoreValue(CLAUDE_MAIL_STORE_KEY, next)
+      setEnabled(next)
+      setStatus(await claudeMailStatus())
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not change it')
+    }
+  }
+
+  if (enabled === null) return <p className="text-xs text-ink-400">Loading…</p>
+  const last = status?.last_access_ms
+    ? new Date(status.last_access_ms).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+    : null
+  return (
+    <div className="space-y-1">
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => void onToggle(e.target.checked)}
+          className="h-4 w-4 accent-accent-500"
+        />
+        <span className="text-xs text-ink-300">{enabled ? 'On' : 'Off'}</span>
+      </label>
+      {status && !status.running && <p className="text-xs text-red-300">The connection did not start. Restart Keyring.</p>}
+      <p className="text-xs text-ink-400">
+        {status?.requests
+          ? `${status.requests} read${status.requests === 1 ? '' : 's'} since Keyring opened, last ${last}. Full log: ~/.config/keyring-claude/access.log`
+          : 'Nothing read since Keyring opened.'}
+      </p>
     </div>
   )
 }
