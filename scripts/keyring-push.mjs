@@ -4,6 +4,7 @@
  *
  *   node scripts/keyring-push.mjs <needs-you.json> [--dry-run]
  *   node scripts/keyring-push.mjs <calendar.json> [--dry-run]     (KEY-CAL-1, file has "source":"calendar")
+ *   node scripts/keyring-push.mjs <todos.json> [--dry-run]        (KEY-TODO-1, file has "source":"todos")
  *
  * Called by the needs-you-list skill after each list. The snapshot file is
  *   {"list_no": 7, "created_at": "<ISO>", "items": [{"id":"N20","section":"asap|instant|think|later",
@@ -13,6 +14,11 @@
  *    "end"?:..., "all_day":true|false, "where"?:"...", "note"?:"...", "link"?:"https://...",
  *    "origin":"google|email|whatsapp|needs_you|claude"}]}
  *   Each push replaces the whole feed (src/lib/inbox/calendarFeed.ts validates it again in the app).
+ * The to-do file (message aggregation) is
+ *   {"source":"todos", "list_no": 1, "todos": [{"id":"e-abc", "title":"...", "due":"YYYY-MM-DD" | "<ISO time>",
+ *    "priority":"low|medium|high", "note"?:"...", "link"?:"https://...", "origin":"email|whatsapp|calendar|logs|claude",
+ *    "done"?:true}]}
+ *   Keyring turns each new id into a task (src/lib/inbox/todos.ts), ticks off done ones, never deletes.
  *
  * How it seals (must match src/lib/inbox/envelope.ts, which the tests check):
  *   ECDH P-256 (fresh ephemeral key x the vault's inbox public key) -> HKDF-SHA256 -> AES-256-GCM
@@ -173,6 +179,40 @@ export function toCalendarPayload(snap) {
   return { v: 1, source: 'calendar', list_no: snap.list_no, created_at, events }
 }
 
+const TODO_ORIGINS = new Set(['email', 'whatsapp', 'calendar', 'logs', 'claude'])
+
+/** KEY-TODO-1: check a to-do list before sealing. */
+export function toTodosPayload(snap) {
+  if (!Number.isInteger(snap?.list_no) || !Array.isArray(snap?.todos)) throw new Error('to-do list needs list_no and todos')
+  if (snap.todos.length > 300) throw new Error(`${snap.todos.length} to-dos; the app reads at most 300`)
+  const created_at = new Date(Math.max(Date.now(), Date.parse(snap.created_at) || 0)).toISOString()
+  const seen = new Set()
+  const todos = snap.todos.map((t, n) => {
+    const id = String(t?.id ?? '')
+    if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(id)) throw new Error(`to-do ${n}: bad id ${id}`)
+    if (seen.has(id)) throw new Error(`to-do ${n}: ${id} appears twice`)
+    seen.add(id)
+    if (typeof t.title !== 'string' || !t.title.trim() || t.title.trim().length > 200) throw new Error(`${id}: title required, under 200 chars`)
+    if (/\u2014/.test(JSON.stringify(t))) throw new Error(`${id}: no em dashes`)
+    if (!TODO_ORIGINS.has(t.origin)) throw new Error(`${id}: origin must be one of ${[...TODO_ORIGINS].join('|')}`)
+    if (!['low', 'medium', 'high'].includes(t.priority)) throw new Error(`${id}: priority must be low|medium|high`)
+    const due = String(t.due ?? '')
+    if (!DAY.test(due) && Number.isNaN(Date.parse(due))) throw new Error(`${id}: due must be YYYY-MM-DD or an ISO time (got ${due})`)
+    const out = { id, title: t.title.trim(), due, priority: t.priority, origin: t.origin }
+    if (t.note) {
+      out.note = String(t.note).trim()
+      if (out.note.length > 2000) throw new Error(`${id}: note is ${out.note.length} chars; keep it under 2000`)
+    }
+    if (t.link) {
+      if (!/^https:\/\/\S+$/.test(t.link)) throw new Error(`${id}: link must be https`)
+      out.link = t.link
+    }
+    if (t.done === true) out.done = true
+    return out
+  })
+  return { v: 1, source: 'todos', list_no: snap.list_no, created_at, todos }
+}
+
 function secret(file) {
   const p = path.join(SECRETS_DIR, file)
   const mode = statSync(p).mode & 0o777
@@ -207,8 +247,9 @@ async function main() {
   if (!file) throw new Error('usage: keyring-push.mjs <needs-you.json | calendar.json> [--dry-run]')
   const dry = flags.includes('--dry-run')
   const snap = JSON.parse(readFileSync(file, 'utf8'))
-  const payload = snap.source === 'calendar' ? toCalendarPayload(snap) : toPayload(snap)
-  const count = payload.source === 'calendar' ? `${payload.events.length} events` : `${payload.items.length} items`
+  const payload = snap.source === 'calendar' ? toCalendarPayload(snap) : snap.source === 'todos' ? toTodosPayload(snap) : toPayload(snap)
+  const count =
+    payload.source === 'calendar' ? `${payload.events.length} events` : payload.source === 'todos' ? `${payload.todos.length} to-dos` : `${payload.items.length} items`
   const writeSecret = secret('write-secret')
   const writerPrivateJwk = JSON.parse(secret('writer-signing-private.jwk'))
 

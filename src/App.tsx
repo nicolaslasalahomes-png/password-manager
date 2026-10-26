@@ -27,6 +27,7 @@ import {
   watchModeFor,
 } from './lib/google/lockedWatch'
 import { armLockedWatch, wipeLockedWatch } from './lib/google/watchArm'
+import { syncClaudeTodos } from './lib/inbox/load'
 import { getAuthSenders } from './lib/email'
 import type { ParsedMessage } from './lib/google/gmail'
 import type { TwoFactorMatch } from './lib/google/twoFactor'
@@ -113,10 +114,40 @@ export default function App() {
 }
 
 function SignedInShell() {
-  const { status: vaultStatus, lockVault, dek } = useVault()
+  const { status: vaultStatus, lockVault, dek, highDek } = useVault()
   const { user } = useAuth()
   const toast = useToast()
   const navigate = useNavigate()
+
+  // KEY-TODO-1: Claude's to-dos (message aggregation) become tasks. On unlock, on focus, every 5 minutes.
+  const userId = user?.id
+  useEffect(() => {
+    if (!isDesktop() || vaultStatus !== 'unlocked' || !dek || !userId) return
+    let stopped = false
+    const run = async () => {
+      if (stopped) return
+      try {
+        const r = await syncClaudeTodos(userId, { dek, highDek })
+        if (r.created || r.updated || r.completed) {
+          window.dispatchEvent(new Event('keyring:tasks-changed'))
+          const bits = [r.created && `${r.created} new`, r.updated && `${r.updated} updated`, r.completed && `${r.completed} done`].filter(Boolean)
+          toast.success(`Claude's to-dos: ${bits.join(', ')}`)
+        }
+        if (r.refused) console.warn('[todos] refused:', r.refused)
+      } catch (err) {
+        console.warn('[todos] sync failed', err)
+      }
+    }
+    void run()
+    const t = setInterval(() => void run(), 5 * 60 * 1000)
+    const onFocus = () => void run()
+    window.addEventListener('focus', onFocus)
+    return () => {
+      stopped = true
+      clearInterval(t)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [vaultStatus, dek, highDek, userId, toast])
 
   // Keep a live ref to vaultStatus so the (mount-once) hotkey handler can
   // always see the current value — not the stale 'locked'/'loading' state

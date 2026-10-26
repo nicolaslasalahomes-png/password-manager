@@ -55,6 +55,13 @@ export default function Todo() {
     void reload()
   }, [reload])
 
+  // KEY-TODO-1: Claude's to-dos landed while this page is open.
+  useEffect(() => {
+    const on = () => void reload()
+    window.addEventListener('keyring:tasks-changed', on)
+    return () => window.removeEventListener('keyring:tasks-changed', on)
+  }, [reload])
+
   useEffect(() => {
     if (!rows || !dek) return
     let cancelled = false

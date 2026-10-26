@@ -10,6 +10,20 @@ import { InboxError, openEnvelope, importWriterKey } from './envelope'
 import { ensureInboxKey, InboxKeyMismatchError } from './keys'
 import { NEEDS_YOU_SOURCE, isRollback, isStale, toSnapshot, type NeedsYouSnapshot } from './needsYou'
 import { CALENDAR_SOURCE, toCalendarFeed, type CalendarFeed } from './calendarFeed'
+import {
+  TAG_PREFIX,
+  TODO_FOLDER,
+  TODOS_SOURCE,
+  dueAt,
+  planTodoSync,
+  revision,
+  taskSig,
+  todoBody,
+  toTodoFeed,
+  type Applied,
+} from './todos'
+import { createItem, decryptItem, listItems, updateItem, type VaultKeys } from '../items'
+import { markTaskComplete } from '../tasks'
 import { WRITER_SIGNING_PUBLIC_JWK } from './writerKey'
 
 export type NeedsYouLoad =
@@ -26,6 +40,7 @@ export type CalendarFeedLoad =
 const LAST_SEEN_KEY: Record<string, string> = {
   [NEEDS_YOU_SOURCE]: 'inboxNeedsYouLastCreatedAt',
   [CALENDAR_SOURCE]: 'inboxCalendarLastCreatedAt',
+  [TODOS_SOURCE]: 'inboxTodosLastCreatedAt',
 }
 
 async function getLastSeen(source: string): Promise<string | null> {
@@ -112,4 +127,97 @@ export async function loadCalendarFeed(userId: string, dek: Uint8Array): Promise
   } catch (err) {
     return refusal(err, 'calendar feed')
   }
+}
+
+// ── KEY-TODO-1: Claude's to-dos become Keyring tasks ──────────────────────────
+
+const APPLIED_KEY = 'claudeTodosApplied'
+
+async function getApplied(): Promise<Applied> {
+  if (isDesktop()) return (await getStoreValue<Applied>(APPLIED_KEY)) ?? {}
+  try {
+    return JSON.parse(localStorage.getItem(APPLIED_KEY) || '{}') as Applied
+  } catch {
+    return {}
+  }
+}
+async function setApplied(v: Applied): Promise<void> {
+  if (isDesktop()) return setStoreValue(APPLIED_KEY, v)
+  try {
+    localStorage.setItem(APPLIED_KEY, JSON.stringify(v))
+  } catch {
+    /* private window: the next sync just re-checks */
+  }
+}
+
+export interface TodoSyncResult {
+  created: number
+  updated: number
+  completed: number
+  refused?: string
+}
+
+let syncing: Promise<TodoSyncResult> | null = null
+
+/** Open Claude's to-do list and bring the vault's tasks in line with it. One run at a time. */
+export function syncClaudeTodos(userId: string, keys: VaultKeys): Promise<TodoSyncResult> {
+  if (!syncing) syncing = runTodoSync(userId, keys).finally(() => (syncing = null))
+  return syncing
+}
+
+async function runTodoSync(userId: string, keys: VaultKeys): Promise<TodoSyncResult> {
+  const result: TodoSyncResult = { created: 0, updated: 0, completed: 0 }
+  let feed
+  try {
+    feed = await openSource(userId, keys.dek, TODOS_SOURCE, toTodoFeed)
+  } catch (err) {
+    return { ...result, refused: refusal(err, 'to-do list').reason }
+  }
+  if (!feed) return result
+  const rows = (await listItems()).filter((r) => (r.tags ?? []).some((t) => t.startsWith(TAG_PREFIX)))
+  const applied = await getApplied()
+  const currentSig: Record<string, string> = {}
+  for (const r of rows) {
+    try {
+      const d = await decryptItem(r, keys)
+      currentSig[r.id] = await taskSig(r.title, r.due_at, r.priority, d.fields.body ?? '')
+    } catch {
+      /* cannot read it: treat as his, never overwrite */
+    }
+  }
+  const plan = planTodoSync(feed, rows, applied, currentSig)
+  for (const t of plan.create) {
+    const row = await createItem(
+      userId,
+      {
+        type: 'task',
+        title: t.title,
+        folder: TODO_FOLDER,
+        tags: [`${TAG_PREFIX}${t.id}`, `from:${t.origin}`],
+        visibility_tier: 'medium',
+        fields: { body: todoBody(t) },
+        url: t.link ?? null,
+        due_at: dueAt(t.due),
+        priority: t.priority,
+      },
+      keys,
+    )
+    applied[t.id] = { rev: revision(t), sig: await taskSig(row.title, row.due_at, row.priority, todoBody(t)) }
+    result.created++
+  }
+  for (const { row, todo } of plan.update) {
+    const next = await updateItem(
+      row.id,
+      { title: todo.title, fields: { body: todoBody(todo) }, url: todo.link ?? null, due_at: dueAt(todo.due), priority: todo.priority },
+      keys,
+    )
+    applied[todo.id] = { rev: revision(todo), sig: await taskSig(next.title, next.due_at, next.priority, todoBody(todo)) }
+    result.updated++
+  }
+  for (const { row } of plan.complete) {
+    await markTaskComplete(row.id)
+    result.completed++
+  }
+  await setApplied(applied)
+  return result
 }
