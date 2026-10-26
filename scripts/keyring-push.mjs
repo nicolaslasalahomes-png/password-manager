@@ -3,10 +3,16 @@
  * VAULT-1 writer: seal Nicolas's Needs-you list and put it in Keyring's sealed inbox.
  *
  *   node scripts/keyring-push.mjs <needs-you.json> [--dry-run]
+ *   node scripts/keyring-push.mjs <calendar.json> [--dry-run]     (KEY-CAL-1, file has "source":"calendar")
  *
  * Called by the needs-you-list skill after each list. The snapshot file is
  *   {"list_no": 7, "created_at": "<ISO>", "items": [{"id":"N20","section":"asap|instant|think|later",
  *    "title":"...", "action"?:"...", "link"?:"https://...", "due"?:"YYYY-MM-DD"}]}
+ * The calendar feed file is
+ *   {"source":"calendar", "list_no": 1, "events": [{"id":"g-abc", "title":"...", "start":"YYYY-MM-DD" | "<ISO time>",
+ *    "end"?:..., "all_day":true|false, "where"?:"...", "note"?:"...", "link"?:"https://...",
+ *    "origin":"google|email|whatsapp|needs_you|claude"}]}
+ *   Each push replaces the whole feed (src/lib/inbox/calendarFeed.ts validates it again in the app).
  *
  * How it seals (must match src/lib/inbox/envelope.ts, which the tests check):
  *   ECDH P-256 (fresh ephemeral key x the vault's inbox public key) -> HKDF-SHA256 -> AES-256-GCM
@@ -126,6 +132,47 @@ export function toPayload(snap) {
   return { v: 1, source: 'needs_you', list_no: snap.list_no, created_at, items }
 }
 
+const ORIGINS = new Set(['google', 'email', 'whatsapp', 'needs_you', 'claude'])
+const DAY = /^\d{4}-\d{2}-\d{2}$/
+
+/** KEY-CAL-1: check a calendar feed before sealing. */
+export function toCalendarPayload(snap) {
+  if (!Number.isInteger(snap?.list_no) || !Array.isArray(snap?.events)) throw new Error('feed needs list_no and events')
+  if (snap.events.length > 500) throw new Error(`${snap.events.length} events; the app shows at most 500`)
+  const created_at = new Date(Math.max(Date.now(), Date.parse(snap.created_at) || 0)).toISOString()
+  const seen = new Set()
+  const events = snap.events.map((e, n) => {
+    const id = String(e?.id ?? '')
+    if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(id)) throw new Error(`event ${n}: bad id ${id}`)
+    if (seen.has(id)) throw new Error(`event ${n}: ${id} appears twice`)
+    seen.add(id)
+    if (typeof e.title !== 'string' || !e.title.trim()) throw new Error(`${id}: title required`)
+    if (e.title.trim().length > 200) throw new Error(`${id}: title over 200 chars`)
+    if (/\u2014/.test(JSON.stringify(e))) throw new Error(`${id}: no em dashes`)
+    if (!ORIGINS.has(e.origin)) throw new Error(`${id}: origin must be one of ${[...ORIGINS].join('|')}`)
+    const allDay = e.all_day === true
+    for (const k of ['start', 'end']) {
+      if (e[k] === undefined && k === 'end') continue
+      const v = String(e[k] ?? '')
+      const ok = allDay ? DAY.test(v) : !DAY.test(v) && !Number.isNaN(Date.parse(v))
+      if (!ok) throw new Error(`${id}: ${k} must be ${allDay ? 'YYYY-MM-DD' : 'an ISO time'} (got ${v})`)
+    }
+    const out = { id, title: e.title.trim(), start: e.start, all_day: allDay, origin: e.origin }
+    if (e.end) out.end = e.end
+    if (e.where) out.where = String(e.where).trim().slice(0, 200)
+    if (e.note) {
+      out.note = String(e.note).trim()
+      if (out.note.length > 1000) throw new Error(`${id}: note is ${out.note.length} chars; keep it under 1000`)
+    }
+    if (e.link) {
+      if (!/^https:\/\/\S+$/.test(e.link)) throw new Error(`${id}: link must be https`)
+      out.link = e.link
+    }
+    return out
+  })
+  return { v: 1, source: 'calendar', list_no: snap.list_no, created_at, events }
+}
+
 function secret(file) {
   const p = path.join(SECRETS_DIR, file)
   const mode = statSync(p).mode & 0o777
@@ -157,9 +204,11 @@ async function fingerprint(jwk) {
 
 async function main() {
   const [file, ...flags] = process.argv.slice(2)
-  if (!file) throw new Error('usage: keyring-push.mjs <needs-you.json> [--dry-run]')
+  if (!file) throw new Error('usage: keyring-push.mjs <needs-you.json | calendar.json> [--dry-run]')
   const dry = flags.includes('--dry-run')
-  const payload = toPayload(JSON.parse(readFileSync(file, 'utf8')))
+  const snap = JSON.parse(readFileSync(file, 'utf8'))
+  const payload = snap.source === 'calendar' ? toCalendarPayload(snap) : toPayload(snap)
+  const count = payload.source === 'calendar' ? `${payload.events.length} events` : `${payload.items.length} items`
   const writeSecret = secret('write-secret')
   const writerPrivateJwk = JSON.parse(secret('writer-signing-private.jwk'))
 
@@ -177,11 +226,11 @@ async function main() {
   const envelope = await seal(payload, { recipientPublicJwk, writerPrivateJwk })
   const size = JSON.stringify(envelope).length
   if (dry) {
-    console.log(`dry run: List ${payload.list_no}, ${payload.items.length} items, envelope ${size} chars, nothing sent`)
+    console.log(`dry run: ${payload.source} ${payload.list_no}, ${count}, envelope ${size} chars, nothing sent`)
     return
   }
-  const r = await call({ action: 'put', source: 'needs_you', envelope: JSON.stringify(envelope) }, writeSecret)
-  console.log(`put List ${payload.list_no} (${payload.items.length} items, ${size} chars) at ${r.updated_at}`)
+  const r = await call({ action: 'put', source: payload.source, envelope: JSON.stringify(envelope) }, writeSecret)
+  console.log(`put ${payload.source} ${payload.list_no} (${count}, ${size} chars) at ${r.updated_at}`)
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

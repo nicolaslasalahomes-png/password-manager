@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ChevronLeft, ChevronRight, Paintbrush, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ExternalLink, MapPin, Paintbrush, Sparkles, X } from 'lucide-react'
 import Layout from '../components/Layout'
 import { useAuth } from '../state/AuthContext'
 import { useVault } from '../state/VaultContext'
@@ -13,6 +13,9 @@ import {
   listDayMarks,
   upsertDayMark,
 } from '../lib/tasks'
+import { loadCalendarFeed, type CalendarFeedLoad } from '../lib/inbox/load'
+import { ORIGIN_LABEL, eventDays, eventTime, type CalendarFeedEvent, type CalendarOrigin } from '../lib/inbox/calendarFeed'
+import { openExternalUrl } from '../lib/desktop'
 
 const PALETTE = [
   '#3b82f6', // blue
@@ -63,6 +66,21 @@ function priorityDot(priority: string | null): string {
   }
 }
 
+/** Feed chips carry a coloured edge by where Claude found the event. */
+const ORIGIN_COLOR: Record<CalendarOrigin, string> = {
+  google: '#3b82f6',
+  email: '#8b5cf6',
+  whatsapp: '#10b981',
+  needs_you: '#ef4444',
+  claude: '#06b6d4',
+}
+
+/** Timed events first by time, all-day events before them. */
+function byStart(a: CalendarFeedEvent, b: CalendarFeedEvent): number {
+  if (a.all_day !== b.all_day) return a.all_day ? -1 : 1
+  return a.start.localeCompare(b.start)
+}
+
 /** Build the month grid: 6 rows × 7 cols, starting on Sunday, with adjacent month's days dim. */
 function buildMonthGrid(viewDate: Date): Date[] {
   const start = startOfMonth(viewDate)
@@ -88,6 +106,7 @@ export default function Calendar() {
   const [marks, setMarks] = useState<DayMarkRow[]>([])
   const [decryptedById, setDecryptedById] = useState<Record<string, DecryptedItem>>({})
   const [selectedDay, setSelectedDay] = useState<string | null>(null)
+  const [feed, setFeed] = useState<CalendarFeedLoad>({ status: 'none' })
 
   const reload = useCallback(async () => {
     try {
@@ -102,6 +121,19 @@ export default function Calendar() {
   useEffect(() => {
     void reload()
   }, [reload])
+
+  // Claude's calendar feed (sealed inbox). Keyed on user.id, never the user object.
+  const userId = user?.id
+  useEffect(() => {
+    if (!userId || !dek) return
+    let cancelled = false
+    void loadCalendarFeed(userId, dek).then((r) => {
+      if (!cancelled) setFeed(r)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [userId, dek])
 
   useEffect(() => {
     if (!tasks || !dek) return
@@ -134,6 +166,19 @@ export default function Calendar() {
     }
     return m
   }, [tasks])
+  const eventsByDay = useMemo(() => {
+    const m = new Map<string, CalendarFeedEvent[]>()
+    if (feed.status !== 'ok') return m
+    for (const e of feed.feed.events) {
+      for (const day of eventDays(e)) {
+        const arr = m.get(day) ?? []
+        arr.push(e)
+        m.set(day, arr)
+      }
+    }
+    for (const arr of m.values()) arr.sort(byStart)
+    return m
+  }, [feed])
   const marksByDay = useMemo(() => {
     const m = new Map<string, DayMarkRow>()
     for (const mk of marks) m.set(mk.day, mk)
@@ -160,6 +205,7 @@ export default function Calendar() {
 
   const selectedTasks = selectedDay ? tasksByDay.get(selectedDay) ?? [] : []
   const selectedMark = selectedDay ? marksByDay.get(selectedDay) : undefined
+  const selectedEvents = selectedDay ? eventsByDay.get(selectedDay) ?? [] : []
 
   return (
     <Layout>
@@ -189,6 +235,22 @@ export default function Calendar() {
             </button>
           </div>
         </div>
+        {feed.status === 'ok' && (
+          <p className="flex items-center gap-1 text-[11px] text-ink-400" title="Events Claude collected for you">
+            <Sparkles size={11} />
+            Claude's feed, updated{' '}
+            {new Date(feed.feed.created_at).toLocaleString(undefined, {
+              weekday: 'short',
+              hour: '2-digit',
+              minute: '2-digit',
+            })}
+          </p>
+        )}
+        {feed.status === 'refused' && (
+          <p className="text-[11px] text-red-300" title={feed.reason}>
+            Claude's feed was not shown: {feed.reason}
+          </p>
+        )}
       </div>
 
       {tasks === null ? (
@@ -206,6 +268,10 @@ export default function Calendar() {
               const dayIso = isoDay(d)
               const isToday = dayIso === todayIso
               const dayTasks = tasksByDay.get(dayIso) ?? []
+              const dayEvents = eventsByDay.get(dayIso) ?? []
+              const shownEvents = dayEvents.slice(0, 3)
+              const shownTasks = dayTasks.slice(0, 3 - shownEvents.length)
+              const hidden = dayEvents.length + dayTasks.length - shownEvents.length - shownTasks.length
               const mark = marksByDay.get(dayIso)
               return (
                 <button
@@ -236,9 +302,20 @@ export default function Calendar() {
                       />
                     )}
                   </div>
-                  {dayTasks.length > 0 && (
+                  {(dayTasks.length > 0 || dayEvents.length > 0) && (
                     <div className="mt-1 flex-1 space-y-0.5 overflow-hidden">
-                      {dayTasks.slice(0, 3).map((t) => (
+                      {shownEvents.map((e) => (
+                        <div
+                          key={'e' + e.id}
+                          title={e.title}
+                          className="flex items-center gap-1 truncate rounded border-l-2 bg-white/5 px-1 py-0.5 text-[10px] leading-tight text-ink-100"
+                          style={{ borderLeftColor: ORIGIN_COLOR[e.origin] }}
+                        >
+                          {!e.all_day && <span className="flex-shrink-0 tabular-nums text-ink-400">{eventTime(e)}</span>}
+                          <span className="truncate">{e.title}</span>
+                        </div>
+                      ))}
+                      {shownTasks.map((t) => (
                         <div
                           key={t.id}
                           title={t.title}
@@ -254,9 +331,7 @@ export default function Calendar() {
                           <span className="truncate">{t.title}</span>
                         </div>
                       ))}
-                      {dayTasks.length > 3 && (
-                        <div className="px-1 text-[9px] text-ink-500">+{dayTasks.length - 3} more</div>
-                      )}
+                      {hidden > 0 && <div className="px-1 text-[9px] text-ink-500">+{hidden} more</div>}
                     </div>
                   )}
                 </button>
@@ -270,6 +345,7 @@ export default function Calendar() {
         <DayDetailPanel
           day={selectedDay}
           tasks={selectedTasks}
+          events={selectedEvents}
           decryptedById={decryptedById}
           mark={selectedMark}
           onClose={() => setSelectedDay(null)}
@@ -284,6 +360,7 @@ export default function Calendar() {
 function DayDetailPanel({
   day,
   tasks,
+  events,
   decryptedById,
   mark,
   onClose,
@@ -292,6 +369,7 @@ function DayDetailPanel({
 }: {
   day: string
   tasks: VaultItemRow[]
+  events: CalendarFeedEvent[]
   decryptedById: Record<string, DecryptedItem>
   mark: DayMarkRow | undefined
   onClose: () => void
@@ -324,6 +402,7 @@ function DayDetailPanel({
           <div>
             <h2 className="text-base font-semibold text-ink-50">{dateLabel}</h2>
             <p className="mt-0.5 text-xs text-ink-400">
+              {events.length > 0 && `${events.length} event${events.length === 1 ? '' : 's'}, `}
               {tasks.length} task{tasks.length === 1 ? '' : 's'} due
             </p>
           </div>
@@ -331,6 +410,47 @@ function DayDetailPanel({
             <X size={14} />
           </button>
         </div>
+
+        {events.length > 0 && (
+          <section className="mb-4 space-y-1.5 border-b border-ink-800 pb-4">
+            <h3 className="mb-2 flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-ink-400">
+              <Sparkles size={11} /> Events
+            </h3>
+            <ul className="max-h-72 space-y-1.5 overflow-y-auto">
+              {events.map((e) => (
+                <li
+                  key={e.id}
+                  className="rounded-md border border-l-2 border-ink-800 px-3 py-2 text-xs"
+                  style={{ borderLeftColor: ORIGIN_COLOR[e.origin] }}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-ink-100">{e.title}</span>
+                    <span className="flex-shrink-0 tabular-nums text-[10px] text-ink-400">
+                      {e.all_day ? 'All day' : eventTime(e)}
+                    </span>
+                  </div>
+                  {e.where && (
+                    <p className="mt-1 flex items-center gap-1 text-[11px] text-ink-400">
+                      <MapPin size={10} /> {e.where}
+                    </p>
+                  )}
+                  {e.note && <p className="mt-1 whitespace-pre-line text-[11px] text-ink-300">{e.note}</p>}
+                  <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-ink-500">
+                    <span>{ORIGIN_LABEL[e.origin]}</span>
+                    {e.link && (
+                      <button
+                        onClick={() => void openExternalUrl(e.link!)}
+                        className="inline-flex items-center gap-1 text-accent-400 hover:underline"
+                      >
+                        Open <ExternalLink size={10} />
+                      </button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         <section className="space-y-2 border-b border-ink-800 pb-4">
           <h3 className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-ink-400">
