@@ -178,10 +178,16 @@ async function saveAttachments(who, id, which, outDir = '.') {
   if (!atts.length) throw new Error(`No attachment ${which}. It has: ${walk(m.payload).attachments.map((x) => x.filename).join(', ') || 'none'}`)
   mkdirSync(outDir, { recursive: true })
   const saved = []
+  const used = new Set()
   for (const x of atts) {
     const data = x.data || (await gmail(a.id, `/messages/${id}/attachments/${x.attachmentId}`)).data
-    // Never let a sender's filename climb out of the folder.
-    const file = path.join(outDir, path.basename(x.filename).replace(/^\.+/, '_') || 'attachment')
+    // Never let a sender's filename climb out of the folder, and number repeats (two "image.png" in one email).
+    const base = path.basename(x.filename).replace(/^\.+/, '_') || 'attachment'
+    const ext = path.extname(base)
+    let name = base
+    for (let n = 2; used.has(name); n++) name = `${base.slice(0, base.length - ext.length)}-${n}${ext}`
+    used.add(name)
+    const file = path.join(outDir, name)
     writeFileSync(file, b64url(data))
     saved.push(file)
   }
