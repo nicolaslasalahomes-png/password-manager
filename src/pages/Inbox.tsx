@@ -882,7 +882,7 @@ function PreviewPane({
             loadCidImages={loadCidImages}
           />
         ) : (
-          <pre className="whitespace-pre-wrap p-5 font-sans text-sm text-ink-950">
+          <pre className="whitespace-pre-wrap p-5 font-sans text-sm text-gray-900">
             {message.bodyText}
           </pre>
         )}
